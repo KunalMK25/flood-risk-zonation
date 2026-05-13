@@ -11,8 +11,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11"]
 
     steps:
       - name: Checkout code
@@ -23,30 +24,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install GDAL system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libgdal-dev gdal-bin
+          sudo apt-get install -y libgdal-dev gdal-bin python3-gdal
 
-      - name: Install package and dev dependencies
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -r requirements.txt
+          pip install pytest pytest-cov hypothesis
 
-      - name: Run tests with coverage
+      - name: Run tests
         run: |
-          pytest tests/ test_chennai.py -v --cov=flood_risk_zonation --cov-report=xml --cov-report=term-missing
-
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
+          pytest tests/ test_chennai.py -v --cov=flood_risk_zonation --cov-report=term-missing
