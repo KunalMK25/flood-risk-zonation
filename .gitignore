@@ -13,8 +13,8 @@ venv/
 env/
 .env/
 
-# Data files (too large for git)
-data/elevation/*.tif
+# Data files — exclude large files but keep small elevation tiles
+# data/elevation/*.tif  <- included (small, ~3KB each)
 data/rainfall/*.tif
 data/cache/
 model/artifacts/
