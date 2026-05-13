@@ -45,16 +45,16 @@ def _fetch(query: str) -> dict | None:
     for mirror in _MIRRORS:
         for _ in range(2):
             try:
-                r = requests.post(mirror, data=query.encode("utf-8"), headers=headers, timeout=45)
+                r = requests.post(mirror, data=query.encode("utf-8"), headers=headers, timeout=20)
                 if r.status_code == 200:
                     return r.json()
                 elif r.status_code == 429:
-                    time.sleep(8)
+                    time.sleep(5)
                 else:
-                    time.sleep(3)
+                    time.sleep(2)
             except Exception as exc:
                 logger.debug("Mirror %s failed: %s", mirror, exc)
-                time.sleep(2)
+                time.sleep(1)
     return None
 
 
