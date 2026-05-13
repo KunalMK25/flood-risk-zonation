@@ -36,7 +36,7 @@ Deployed on Streamlit Cloud: [https://share.streamlit.io](https://flood-risk-zon
 
 ## Run Locally
 
-`ash
+`ash
 git clone https://github.com/KunalMK25/flood-risk-zonation.git
 cd flood-risk-zonation
 pip install -r requirements.txt
