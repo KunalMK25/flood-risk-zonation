@@ -3,7 +3,7 @@
 An ML-powered geospatial web app that generates micro-level flood risk zone maps for any region worldwide.
 
 ## Live Demo
-Deploy on Streamlit Cloud: https://share.streamlit.io
+Deployed on Streamlit Cloud: [https://share.streamlit.io](https://flood-risk-zonation-ezw8ngm5igpy6egpdmgsqw.streamlit.app/)
 
 ## Features
 - Interactive Risk Map with color-coded flood risk zones (High/Medium/Low/Water)
@@ -57,7 +57,7 @@ Open http://localhost:8501
 ## Deploy on Streamlit Cloud
 
 1. Fork this repo
-2. Go to https://share.streamlit.io
+2. Go to [https://share.streamlit.io](https://flood-risk-zonation-ezw8ngm5igpy6egpdmgsqw.streamlit.app/)
 3. Click New app, select this repo, set main file to app.py
 4. Click Deploy
 
