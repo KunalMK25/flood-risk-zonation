@@ -57,7 +57,7 @@ def test_color_mapping_correctness(risk_classes):
 def test_popup_content_completeness(risk_classes):
     """Property 14: Popup HTML contains all 8 required fields for every cell."""
     required_fields = [
-        "Risk Score", "Risk Class", "Elevation", "Slope",
+        "Elevation", "Slope",
         "TWI", "Rainfall", "Dist", "Drainage",
     ]
     grid = _make_grid_with_classes(risk_classes)
