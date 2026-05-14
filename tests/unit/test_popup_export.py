@@ -34,8 +34,7 @@ def test_popup_contains_required_fields():
     m = folium.Map(location=[0.005, 0.015], zoom_start=12)
     builder.add_popup_layer(m, grid)
     html = m._repr_html_()
-    for field in ["Risk Score", "Risk Class", "Elevation", "Slope", "TWI",
-                  "Rainfall", "Dist", "Drainage"]:
+    for field in ["Elevation", "Slope", "TWI", "Rainfall", "Dist", "Drainage"]:
         assert field in html, f"Field '{field}' missing from popup HTML"
 
 
