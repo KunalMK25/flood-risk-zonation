@@ -210,18 +210,6 @@ Tests include both standard `pytest` unit tests and **Hypothesis property-based 
 
 ---
 
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repo and create a feature branch (`git checkout -b feature/my-feature`)
-2. Write tests for new functionality
-3. Open a pull request with a clear description of what you changed and why
-
-For larger changes, please open an issue first to discuss the approach.
-
----
-
 ## 📄 License
 
 [MIT](LICENSE) — free to use, modify, and distribute.
