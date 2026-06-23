@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/KunalMK25/flood-risk-zonation/test.yml?label=tests)](https://github.com/KunalMK25/flood-risk-zonation/actions)
 
-An ML-powered geospatial web app that generates **micro-level flood risk zone maps** for any region worldwide — using real NASA SRTM elevation, live OpenStreetMap water bodies, and a Random Forest classifier with cross-validated AUC ~0.97.
+A geospatial web app that generates **micro-level flood risk zone maps** for any region worldwide — using real NASA SRTM elevation, live OpenStreetMap water bodies, and a transparent **Weighted Susceptibility Index** model with inspectable factor weights.
 
 ---
 
@@ -21,13 +21,15 @@ An ML-powered geospatial web app that generates **micro-level flood risk zone ma
 |---|---|
 | 🗺️ Interactive Risk Map | Color-coded flood risk zones (High / Medium / Low / Water) via Folium |
 | 🌍 Global Coverage | Works for any bounding box worldwide using live OpenStreetMap data |
-| ⛰️ Real Elevation Data | NASA SRTM 30m DEM via OpenTopoData API |
-| 💧 Live Water Body Detection | Fetches lakes, rivers, canals, ocean from OSM Overpass API |
+| ⛰️ Real Elevation Data | NASA SRTM 30m DEM via local GeoTIFF; synthetic fallback |
+| 💧 Live Water Body Detection | Fetches lakes, rivers, canals, ocean from OSM Overpass API (with retry + local cache) |
 | 🌧️ Rainfall Layer | IMD/GPM-calibrated rainfall intensity heatmap |
-| 🤖 ML Model | Random Forest classifier with 5-fold stratified CV (AUC ~0.97) |
+| 🔍 Per-cell Explainability | Click any cell for a data-driven factor breakdown with risk contribution bars |
+| ⚠️ Coastal Tsunami Flag | Cells within 1.5× cell-size of ocean/sea geometry are flagged in the popup |
+| 🤖 Transparent Model | Weighted Susceptibility Index — declared weights and risk directions, no black-box ML |
 | 📄 PDF Report Generator | Full flood risk report with emergency deployment plan |
-| 🔍 Click Popups | Per-cell risk factor breakdown (elevation, TWI, drainage, rainfall) |
 | ⬇️ Export | Download results as CSV, GeoJSON, or interactive HTML |
+| 📦 Offline Demo Mode | Pre-configured sample data for three regions — no network required |
 
 ---
 
@@ -39,10 +41,28 @@ flood-risk-zonation/
 │   ├── config.py               # BoundingBox, PipelineConfig dataclasses
 │   ├── pipeline.py             # End-to-end orchestration
 │   ├── exceptions.py           # Custom error types
+│   ├── models.py               # RasterDataset, FloodRiskResult, AnalysisResult, etc.
 │   ├── features/
 │   │   └── extractor.py        # 10-feature geospatial extractor
+│   ├── grid/
+│   │   └── generator.py        # BoundingBox → cell GeoDataFrame
+│   ├── ingest/
+│   │   ├── elevation.py        # SRTM loader + synthetic fallback
+│   │   ├── rainfall.py         # GPM/IMD loader + synthetic fallback
+│   │   ├── water_bodies.py     # OSM Overpass fetcher with retry + cache
+│   │   ├── drainage.py         # Synthetic drainage capacity generator
+│   │   ├── population.py       # Population density loader
+│   │   └── sample_data.py      # Bundled offline demo data (3 regions)
+│   ├── scoring/
+│   │   ├── scorer.py           # Grid scorer (maps model output → risk class)
+│   │   └── susceptibility.py   # WeightedSusceptibilityModel
+│   ├── utils/
+│   │   ├── cache.py            # Grid/data cache helpers
+│   │   └── validation.py       # Input validation + NaN imputation
 │   └── visualization/
-│       ├── map_builder.py      # Folium choropleth map
+│       ├── map_builder.py      # Folium choropleth map orchestrator
+│       ├── layers.py           # Individual Folium layer builders
+│       ├── explainability.py   # Per-cell tooltip/popup HTML generator
 │       ├── export.py           # CSV / GeoJSON / HTML export
 │       └── pdf_report.py       # ReportLab PDF generator
 ├── tests/                      # pytest + Hypothesis property-based tests
@@ -53,10 +73,8 @@ flood-risk-zonation/
 │       └── test.yml            # CI — runs pytest on every push
 ├── app.py                      # Streamlit entry point
 ├── requirements.txt            # Runtime dependencies
-├── pyproject.toml              # Package metadata & build config
-└── write_wb_module.py          # Utility: writes World Bank-style CSV outputs
+└── pyproject.toml              # Package metadata & build config
 ```
-
 
 ---
 
@@ -66,25 +84,27 @@ flood-risk-zonation/
 Bounding Box Input
        │
        ▼
-1. Grid Generation     — divides bbox into configurable cells (250m / 500m / 1km)
+1. Grid Generation        — divides bbox into configurable cells (250m / 500m / 1km)
        │
        ▼
-2. Data Ingestion      — fetches real SRTM elevation + OSM water bodies
+2. Data Ingestion         — fetches real SRTM elevation + OSM water bodies
+       │                    (retried up to 3×; falls back to synthetic if unavailable)
+       ▼
+3. Feature Extraction     — computes 10 features per cell
        │
        ▼
-3. Feature Extraction  — computes 10 features per cell
+4. Susceptibility Model   — transparent weighted index (declared weights, no ML training)
        │
        ▼
-4. ML Training         — trains Random Forest (5-fold stratified CV)
+5. Risk Scoring           — normalises index → [0, 100] → Low / Medium / High
        │
        ▼
-5. Risk Scoring        — normalises predictions → [0, 100] → Low/Medium/High
-       │
+6. Post-processing        — water masking (elevation + OSM polygon centroid test)
+       │                    proximity boost for cells near water
+       │                    coastal tsunami flag for cells near ocean/sea
        ▼
-6. Water Masking       — marks permanent water cells (blue) via elevation + OSM
-       │
-       ▼
-7. Visualisation       — interactive Folium map + optional PDF/CSV/GeoJSON export
+7. Visualisation          — interactive Folium map + per-cell explainability popups
+                            + optional PDF / CSV / GeoJSON export
 ```
 
 ---
@@ -100,13 +120,26 @@ Ten conditioning factors are computed per grid cell:
 | TWI | Topographic Wetness Index: `ln(A / tan(β))` |
 | Annual Rainfall | Mean annual precipitation (mm) — NASA GPM IMERG where available |
 | Max 24-hr Rainfall | Extreme rainfall intensity (mm) |
-| Distance to Water | Nearest OSM water body (m, log-scaled) |
+| Distance to Water | Nearest OSM water body (m) |
 | Drainage Capacity | Synthetic score [0, 1] |
-| Population Density | Persons/km² (log-scaled) |
-| Aspect | Terrain aspect (degrees from north) |
+| Population Density | Persons/km² |
+| Aspect | Terrain aspect (degrees from north) — computed but not weighted |
 | Curvature | Plan curvature |
 
-**Model:** Random Forest (200 trees, 5-fold stratified CV). LightGBM available as an alternative via the sidebar.
+**Model:** `WeightedSusceptibilityModel` — each factor is robustly normalised using its 5th–95th percentile range, then combined with a declared weight and risk direction (see table below). No ML training; output is a relative index whose weights are fully inspectable.
+
+| Factor | Weight | Direction |
+|---|---|---|
+| Elevation | 0.15 | Low elevation → higher risk |
+| TWI | 0.15 | High TWI → higher risk |
+| Max 24-hr Rainfall | 0.15 | Higher → higher risk |
+| Distance to Water | 0.15 | Closer → higher risk |
+| Drainage Capacity | 0.15 | Poor drainage → higher risk |
+| Annual Rainfall | 0.10 | Higher → higher risk |
+| Slope | 0.05 | Flat terrain → higher risk |
+| Population Density | 0.05 | Higher → higher risk |
+| Curvature | 0.05 | Concave → higher risk |
+| Aspect | — | Not weighted (no global relationship) |
 
 > ⚠️ **Data transparency:** When the NASA GPM API is unavailable, rainfall falls back to a region-calibrated synthetic layer (e.g. 970 mm/yr for Bangalore). The active data tier is shown in the UI after each run. See [Data Tiers](#-data-tiers) below.
 
@@ -121,17 +154,34 @@ Ten conditioning factors are computed per grid cell:
 | 🟢 Low Risk | Green | ≤ 33 | Higher elevation, good drainage |
 | 🔵 Water | Blue | N/A | Permanent water body (lake / river / ocean) |
 
+Classification thresholds are adjustable via the sidebar sliders.
+
+---
+
+## 🗺️ Water Masking & Post-Processing
+
+The pipeline applies a four-step post-scoring pass:
+
+| Step | Description |
+|---|---|
+| Elevation mask | Cells with SRTM elevation ≤ 1 m → Water (skipped for synthetic elevation) |
+| OSM polygon mask | Cells whose centroid lies inside an OSM area water body (lake, reservoir, bay, ocean) → Water |
+| Proximity boost | Land cells within 0.6 × cell_size of any water geometry → boosted to at least Medium |
+| Coastal flag | Land cells within 1.5 × cell_size of ocean/sea geometry → `is_coastal_tsunami_risk = True` flag shown in popup |
+
+Linear water features (drains, streams, rivers, canals) contribute to the proximity boost but do **not** mask cells as Water, preventing false positives from thin sliver polygons.
+
 ---
 
 ## 📡 Data Sources
 
 | Dataset | Source | Resolution | Notes |
 |---|---|---|---|
-| Elevation (DEM) | NASA SRTM via OpenTopoData | ~30m | Tier 1 |
-| Rainfall | NASA GPM IMERG | 0.1° | Tier 1; synthetic fallback = Tier 2/3 |
-| Water Bodies | OpenStreetMap Overpass API | Vector | Tier 1 |
-| Drainage Lines | OpenStreetMap Overpass API | Vector | Tier 1 |
-| Population Density | WorldPop-style synthetic | ~1km | Tier 2/3 |
+| Elevation (DEM) | NASA SRTM via local GeoTIFF | ~30m | Tier 1; synthetic fallback = Tier 2/3 |
+| Rainfall | NASA GPM IMERG / IMD | 0.1° | Tier 1; synthetic fallback = Tier 2/3 |
+| Water Bodies | OpenStreetMap Overpass API | Vector | Tier 1; cached locally by bbox |
+| Drainage Lines | OpenStreetMap (local GeoJSON) | Vector | Visualisation only |
+| Population Density | Local raster or synthetic fallback | ~1km | Tier 2/3 |
 
 ### 📶 Data Tiers
 
@@ -154,6 +204,8 @@ The active tier is displayed in the app after each pipeline run.
 | Dal Lake, Srinagar | 74.83 | 34.07 | 74.90 | 34.14 |
 | Puri, Odisha (Cyclone coast) | 85.80 | 19.77 | 85.87 | 19.84 |
 
+These three regions are also available as **offline demo presets** via the sidebar — no network required.
+
 ---
 
 ## 🖥️ Run Locally
@@ -174,6 +226,8 @@ streamlit run app.py
 ```
 
 Open [http://localhost:8501](http://localhost:8501)
+
+Bounding boxes must be between **2 km and 50 km** per side. A live size preview is shown in the sidebar as you adjust the coordinates.
 
 ---
 
@@ -201,9 +255,9 @@ Tests include both standard `pytest` unit tests and **Hypothesis property-based 
 | Layer | Library |
 |---|---|
 | Frontend | Streamlit, Folium |
-| ML | scikit-learn (Random Forest), LightGBM |
+| Model | `WeightedSusceptibilityModel` (custom deterministic index) |
 | Geospatial | GeoPandas, Rasterio, Shapely, PyProj |
-| Data | NASA SRTM, OpenStreetMap, NASA GPM IMERG |
+| Data | NASA SRTM, OpenStreetMap Overpass API, NASA GPM IMERG |
 | PDF | ReportLab |
 | Testing | pytest, Hypothesis, pytest-cov |
 

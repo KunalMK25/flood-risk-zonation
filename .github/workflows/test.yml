@@ -37,4 +37,4 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest tests/ test_chennai.py -v --cov=flood_risk_zonation --cov-report=term-missing
+          pytest tests/ -v --cov=flood_risk_zonation --cov-report=term-missing

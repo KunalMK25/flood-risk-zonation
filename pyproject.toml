@@ -56,6 +56,6 @@ where = ["."]
 include = ["flood_risk_zonation*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "--cov=flood_risk_zonation --cov-report=term-missing"
