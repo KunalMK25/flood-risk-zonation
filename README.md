@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/KunalMK25/flood-risk-zonation/test.yml?label=tests)](https://github.com/KunalMK25/flood-risk-zonation/actions)
 
-A geospatial web app that generates **micro-level flood risk zone maps** for any region worldwide — using real NASA SRTM elevation, live OpenStreetMap water bodies, and a transparent **Weighted Susceptibility Index** model with inspectable factor weights.
+A geospatial web app that generates **flood risk zone maps** for any region worldwide — using real NASA SRTM elevation, live OpenStreetMap water bodies, and two interchangeable susceptibility models: a transparent **Weighted Susceptibility Index** and an **ML-powered Random Forest** trained via 5-fold cross-validation.
 
 ---
 
@@ -26,7 +26,7 @@ A geospatial web app that generates **micro-level flood risk zone maps** for any
 | 🌧️ Rainfall Layer | IMD/GPM-calibrated rainfall intensity heatmap |
 | 🔍 Per-cell Explainability | Click any cell for a data-driven factor breakdown with risk contribution bars |
 | ⚠️ Coastal Tsunami Flag | Cells within 1.5× cell-size of ocean/sea geometry are flagged in the popup |
-| 🤖 Transparent Model | Weighted Susceptibility Index — declared weights and risk directions, no black-box ML |
+| 🤖 Dual Susceptibility Models | Weighted Susceptibility Index (transparent, instant) or Random Forest ML (5-fold CV with AUC & F1) |
 | 📄 PDF Report Generator | Full flood risk report with emergency deployment plan |
 | ⬇️ Export | Download results as CSV, GeoJSON, or interactive HTML |
 | 📦 Offline Demo Mode | Pre-configured sample data for three regions — no network required |
@@ -55,7 +55,7 @@ flood-risk-zonation/
 │   │   └── sample_data.py      # Bundled offline demo data (3 regions)
 │   ├── scoring/
 │   │   ├── scorer.py           # Grid scorer (maps model output → risk class)
-│   │   └── susceptibility.py   # WeightedSusceptibilityModel
+│   │   └── susceptibility.py   # WeightedSusceptibilityModel + RandomForestSusceptibilityModel
 │   ├── utils/
 │   │   ├── cache.py            # Grid/data cache helpers
 │   │   └── validation.py       # Input validation + NaN imputation
@@ -93,10 +93,10 @@ Bounding Box Input
 3. Feature Extraction     — computes 10 features per cell
        │
        ▼
-4. Susceptibility Model   — transparent weighted index (declared weights, no ML training)
+4. Susceptibility Model   — WSI (default) or Random Forest ML — selectable in sidebar
        │
        ▼
-5. Risk Scoring           — normalises index → [0, 100] → Low / Medium / High
+5. Risk Scoring           — normalises model output → [0, 100] → Low / Medium / High
        │
        ▼
 6. Post-processing        — water masking (elevation + OSM polygon centroid test)
@@ -126,7 +126,11 @@ Ten conditioning factors are computed per grid cell:
 | Aspect | Terrain aspect (degrees from north) — computed but not weighted |
 | Curvature | Plan curvature |
 
-**Model:** `WeightedSusceptibilityModel` — each factor is robustly normalised using its 5th–95th percentile range, then combined with a declared weight and risk direction (see table below). No ML training; output is a relative index whose weights are fully inspectable.
+**Model:** Two interchangeable options, selectable from the sidebar under **Method**:
+
+### Option 1 — Weighted Susceptibility Index (default)
+
+`WeightedSusceptibilityModel` — each factor is robustly normalised using its 5th–95th percentile range, then combined with a declared weight and risk direction. No training data required. Fully transparent and instant.
 
 | Factor | Weight | Direction |
 |---|---|---|
@@ -139,7 +143,20 @@ Ten conditioning factors are computed per grid cell:
 | Slope | 0.05 | Flat terrain → higher risk |
 | Population Density | 0.05 | Higher → higher risk |
 | Curvature | 0.05 | Concave → higher risk |
-| Aspect | — | Not weighted (no global relationship) |
+| Aspect | — | Computed but not weighted (no global relationship) |
+
+### Option 2 — Random Forest (ML)
+
+`RandomForestSusceptibilityModel` — a real ML model that uses the WSI score to generate pseudo-labels, then trains a Random Forest classifier with **5-fold stratified cross-validation**. Reports AUC-ROC and F1 per fold after each run.
+
+**Workflow:**
+1. WSI scores are computed for all cells
+2. Top 33% of cells by WSI score → labelled as high-risk (1); rest → low-risk (0)
+3. Random Forest (200 trees) trained on `(features, pseudo-labels)` with stratified 5-fold CV
+4. Final model trained on all data; CV metrics shown in the **Factor Weights** tab
+5. RF feature importances replace the hand-coded WSI weights in the chart
+
+The RF uses the same scoring pipeline and post-processing as WSI — only the susceptibility model changes. It is a drop-in replacement.
 
 > ⚠️ **Data transparency:** When the NASA GPM API is unavailable, rainfall falls back to a region-calibrated synthetic layer (e.g. 970 mm/yr for Bangalore). The active data tier is shown in the UI after each run. See [Data Tiers](#-data-tiers) below.
 
@@ -255,7 +272,8 @@ Tests include both standard `pytest` unit tests and **Hypothesis property-based 
 | Layer | Library |
 |---|---|
 | Frontend | Streamlit, Folium |
-| Model | `WeightedSusceptibilityModel` (custom deterministic index) |
+| ML Model | scikit-learn (Random Forest, 5-fold CV) |
+| Susceptibility Index | `WeightedSusceptibilityModel` (transparent deterministic index) |
 | Geospatial | GeoPandas, Rasterio, Shapely, PyProj |
 | Data | NASA SRTM, OpenStreetMap Overpass API, NASA GPM IMERG |
 | PDF | ReportLab |
