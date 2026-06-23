@@ -94,8 +94,16 @@ class FloodRiskPipeline:
                 logger.info("Real elevation loaded from %s.", elevation.source)
             except FloodRiskError as exc:
                 logger.warning("Real elevation unavailable (%s).", exc)
+        # Fallback 1: fetch from OpenTopoData SRTM API (gives real ocean=0 values)
+        if elevation is None and config.allow_network:
+            from flood_risk_zonation.ingest.elevation import fetch_elevation_api
+            logger.info("Fetching elevation from OpenTopoData SRTM API...")
+            elevation = fetch_elevation_api(bounding_box, resolution_m=500)
+            if elevation is not None:
+                logger.info("OpenTopoData elevation fetched successfully.")
+        # Fallback 2: synthetic (no ocean detection possible)
         if elevation is None:
-            logger.warning("No SRTM file covers this bbox, using synthetic elevation.")
+            logger.warning("No SRTM file or API available, using synthetic elevation.")
             elevation = generate_synthetic_elevation(bounding_box, resolution_m=500, seed=seed)
         provenance["elevation"] = elevation.source
 
@@ -247,29 +255,40 @@ class FloodRiskPipeline:
         scored_grid,
         water_bodies,
         config,
-        elevation_source='real',
+        elevation_source="real",
     ):
-        from shapely.geometry import Point, box as shapely_box
+        """
+        Post-scoring pipeline:
+        1. ELEVATION MASK  - cells with elevation <= 2 m -> Water.
+                             Uses real SRTM from OpenTopoData API (ocean = 0 m).
+                             Skipped for synthetic/offline elevation.
+        2. OSM AREA MASK   - cells with >= 60% area covered by OSM water
+                             polygons (lakes, reservoirs, bays) -> Water.
+                             Coastline LineStrings excluded (unreliable for masking).
+        3. PROXIMITY BOOST - land cells within 0.6 x cell_size of any water -> boost.
+        4. COASTAL FLAG    - land cells within 1.5 x cell_size of ocean -> tsunami flag.
+        """
+        from shapely.geometry import Point
         from shapely.ops import unary_union
+        import geopandas as _gpd
 
         result = scored_grid.copy()
-        result['is_coastal_tsunami_risk'] = False
-        result['water_mask_reason'] = ''
-        result['water_coverage_pct'] = 0.0
+        result["is_coastal_tsunami_risk"] = False
+        result["water_mask_reason"] = ""
+        result["water_coverage_pct"] = 0.0
 
-        OCEAN_TYPES = {'coastline', 'bay', 'sea', 'ocean'}
-        AREA_WATER_TYPES = {'water', 'reservoir', 'basin', 'bay', 'sea', 'ocean', 'coastline'}
-        LINEAR_BOOST_TYPES = {'river', 'canal', 'stream', 'drain', 'ditch'}
+        OCEAN_TYPES = {"coastline", "bay", "sea", "ocean"}
+        AREA_WATER_TYPES = {"water", "reservoir", "basin", "bay", "sea", "ocean", "coastline"}
+        LINEAR_TYPES = {"river", "canal", "stream", "drain", "ditch"}
 
         area_water_geoms = []
-        coastline_lines = []
-        boost_geoms = []
         ocean_area_geoms = []
+        boost_geoms = []
 
         if water_bodies is not None and len(water_bodies) > 0:
             wb = water_bodies.copy()
-            if wb.crs and str(wb.crs).upper() != 'EPSG:4326':
-                wb = wb.to_crs('EPSG:4326')
+            if wb.crs and str(wb.crs).upper() != "EPSG:4326":
+                wb = wb.to_crs("EPSG:4326")
             for _, row in wb.iterrows():
                 geom = row.geometry
                 if geom is None or geom.is_empty:
@@ -277,91 +296,40 @@ class FloodRiskPipeline:
                 geom = geom if geom.is_valid else geom.buffer(0)
                 if geom.is_empty or not geom.is_valid:
                     continue
-                wtype = str(row.get('water_type', '')).lower()
+                wtype = str(row.get("water_type", "")).lower()
                 boost_geoms.append(geom)
-                if geom.geom_type in {'LineString', 'MultiLineString'}:
-                    if wtype == 'coastline' or wtype in OCEAN_TYPES:
-                        coastline_lines.append(geom)
-                else:
+                if geom.geom_type in {"Polygon", "MultiPolygon"}:
                     if wtype in AREA_WATER_TYPES:
                         area_water_geoms.append(geom)
                         if wtype in OCEAN_TYPES:
                             ocean_area_geoms.append(geom)
-                    elif wtype not in LINEAR_BOOST_TYPES:
+                    elif wtype not in LINEAR_TYPES:
                         area_water_geoms.append(geom)
 
-        lon_min = float(result['centroid_lon'].min()) - 0.001
-        lon_max = float(result['centroid_lon'].max()) + 0.001
-        lat_min = float(result['centroid_lat'].min()) - 0.001
-        lat_max = float(result['centroid_lat'].max()) + 0.001
-        bbox_poly = shapely_box(lon_min, lat_min, lon_max, lat_max)
+        # Step 1: elevation mask (primary ocean detector)
+        # Real SRTM via OpenTopoData returns ocean pixels as 0 m.
+        synthetic_sources = {"synthetic", "offline_sample"}
+        if elevation_source not in synthetic_sources and "elevation_m" in result.columns:
+            sea_mask = result["elevation_m"].values <= 2.0
+            n_sea = int(sea_mask.sum())
+            if n_sea > 0:
+                result.loc[sea_mask, "risk_class"] = "Water"
+                result.loc[sea_mask, "risk_score"] = 0.0
+                result.loc[sea_mask, "water_mask_reason"] = "elevation"
+                logger.info("Elevation mask: %d cells (elev <= 2 m) -> Water.", n_sea)
 
-        # Build ocean polygon from coastline using RIGHT-SIDE buffer
-        # OSM coastline convention: land is LEFT, sea is RIGHT of line direction.
-        # We buffer the line on the right side by sweeping a wide band seaward,
-        # then intersect with bbox to get the ocean area.
-        ocean_polygon = None
-        if coastline_lines:
-            try:
-                import geopandas as _gpd_c
-                coast_union = unary_union(coastline_lines)
-                # Convert to metric CRS for buffering
-                coast_gdf = _gpd_c.GeoDataFrame(geometry=[coast_union], crs='EPSG:4326').to_crs('EPSG:3857')
-                coast_m = coast_gdf.geometry.iloc[0]
-                # Wide buffer (5x cell size) to cover the full ocean area in bbox
-                wide_buf_m = config.cell_size_meters * 5.0
-                ocean_buf_m = coast_m.buffer(wide_buf_m, single_sided=True)
-                # Back to 4326
-                ocean_buf_gdf = _gpd_c.GeoDataFrame(geometry=[ocean_buf_m], crs='EPSG:3857').to_crs('EPSG:4326')
-                ocean_buf_4326 = ocean_buf_gdf.geometry.iloc[0]
-                # Clip to bbox
-                ocean_candidate = ocean_buf_4326.intersection(bbox_poly)
-                if not ocean_candidate.is_empty:
-                    # Verify: the ocean candidate should contain FEWER grid centroids than land
-                    n_in = sum(1 for _, r in result.iterrows()
-                               if ocean_candidate.contains(Point(r['centroid_lon'], r['centroid_lat'])))
-                    n_total = len(result)
-                    # If candidate contains more than 80% of centroids, it's likely wrong side
-                    # Try the opposite side
-                    if n_in > n_total * 0.8:
-                        ocean_buf_m2 = coast_m.buffer(-wide_buf_m, single_sided=True)
-                        ocean_buf_gdf2 = _gpd_c.GeoDataFrame(geometry=[ocean_buf_m2], crs='EPSG:3857').to_crs('EPSG:4326')
-                        ocean_candidate2 = ocean_buf_gdf2.geometry.iloc[0].intersection(bbox_poly)
-                        n_in2 = sum(1 for _, r in result.iterrows()
-                                    if ocean_candidate2.contains(Point(r['centroid_lon'], r['centroid_lat'])))
-                        if n_in2 < n_in:
-                            ocean_candidate = ocean_candidate2
-                    ocean_polygon = ocean_candidate
-                    ocean_area_geoms.append(ocean_polygon)
-                    boost_geoms.append(ocean_polygon)
-                    logger.info('Ocean polygon (right-side buffer): covers ~%d cells.', 
-                                sum(1 for _, r in result.iterrows()
-                                    if ocean_polygon.contains(Point(r['centroid_lon'], r['centroid_lat']))))
-            except Exception as exc:
-                logger.warning('Ocean polygon (right-side buffer) failed: %s', exc)
-
-        # Pure ocean bbox: no OSM features + low elevation
-        if not coastline_lines and not area_water_geoms and 'elevation_m' in result.columns:
-            finite_elev = result['elevation_m'].values[np.isfinite(result['elevation_m'].values)]
-            if len(finite_elev) > 0 and float(np.percentile(finite_elev, 90)) <= 10.0:
-                ocean_polygon = bbox_poly
-                area_water_geoms.append(bbox_poly)
-                ocean_area_geoms.append(bbox_poly)
-                boost_geoms.append(bbox_poly)
-                logger.info('Pure ocean bbox detected.')
-
-        # Step 1: coverage mask for OSM area water bodies (lakes/ponds/reservoirs)
+        # Step 2: OSM polygon coverage mask (lakes, ponds, reservoirs)
         if area_water_geoms:
             try:
-                import geopandas as _gpd
                 water_union_4326 = unary_union(area_water_geoms)
-                _wdf = _gpd.GeoDataFrame(geometry=[water_union_4326], crs='EPSG:4326')
-                water_union_m = _wdf.to_crs('EPSG:3857').geometry.iloc[0]
-                grid_m = _gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326').to_crs('EPSG:3857')
-                coverage_water = np.zeros(len(result), dtype=bool)
+                _wdf = _gpd.GeoDataFrame(geometry=[water_union_4326], crs="EPSG:4326")
+                water_union_m = _wdf.to_crs("EPSG:3857").geometry.iloc[0]
+                grid_m = _gpd.GeoDataFrame(result, geometry="geometry", crs="EPSG:4326").to_crs("EPSG:3857")
+                already_water = result["risk_class"].values == "Water"
                 coverage_pct = np.zeros(len(result), dtype=float)
+                coverage_water = np.zeros(len(result), dtype=bool)
                 for i, cell_geom in enumerate(grid_m.geometry):
-                    if cell_geom is None or cell_geom.is_empty:
+                    if already_water[i] or cell_geom is None or cell_geom.is_empty:
                         continue
                     try:
                         inter = cell_geom.intersection(water_union_m)
@@ -374,75 +342,34 @@ class FloodRiskPipeline:
                     except Exception:
                         continue
                 if coverage_water.any():
-                    result.loc[coverage_water, 'risk_class'] = 'Water'
-                    result.loc[coverage_water, 'risk_score'] = 0.0
-                    result.loc[coverage_water, 'water_mask_reason'] = 'coverage'
-                    result['water_coverage_pct'] = (coverage_pct * 100).round(1)
-                    logger.info('Coverage mask: %d cells -> Water.', int(coverage_water.sum()))
-                else:
-                    result['water_coverage_pct'] = 0.0
+                    result.loc[coverage_water, "risk_class"] = "Water"
+                    result.loc[coverage_water, "risk_score"] = 0.0
+                    result.loc[coverage_water, "water_mask_reason"] = "coverage"
+                    result["water_coverage_pct"] = (coverage_pct * 100).round(1)
+                    logger.info("OSM coverage mask: %d cells -> Water.", int(coverage_water.sum()))
             except Exception as exc:
-                logger.warning('Coverage mask failed: %s', exc)
-
-        # Step 1b: ocean centroid mask - cells whose centroid is inside ocean polygon
-        if ocean_polygon is not None and not ocean_polygon.is_empty:
-            try:
-                already_water = result['risk_class'].values == 'Water'
-                # Shrink ocean polygon by 0.5 cell to avoid coast straddlers
-                shrink_deg = (config.cell_size_meters * 0.5) / 111_320.0
-                try:
-                    ocean_shrunk = ocean_polygon.buffer(-shrink_deg)
-                except Exception:
-                    ocean_shrunk = ocean_polygon
-                if ocean_shrunk and not ocean_shrunk.is_empty:
-                    ocean_water = np.zeros(len(result), dtype=bool)
-                    for i, (_, r) in enumerate(result.iterrows()):
-                        if already_water[i]:
-                            continue
-                        try:
-                            if ocean_shrunk.contains(Point(r['centroid_lon'], r['centroid_lat'])):
-                                ocean_water[i] = True
-                        except Exception:
-                            pass
-                    if ocean_water.any():
-                        result.loc[ocean_water, 'risk_class'] = 'Water'
-                        result.loc[ocean_water, 'risk_score'] = 0.0
-                        result.loc[ocean_water, 'water_mask_reason'] = 'ocean'
-                        logger.info('Ocean centroid mask: %d cells -> Water.', int(ocean_water.sum()))
-            except Exception as exc:
-                logger.warning('Ocean centroid mask failed: %s', exc)
-
-        # Step 2: elevation fallback (real SRTM only)
-        if elevation_source not in {'synthetic', 'offline_sample'} and 'elevation_m' in result.columns:
-            already_water = result['risk_class'].values == 'Water'
-            sea_mask = (result['elevation_m'].values <= 2.0) & ~already_water
-            if sea_mask.sum() > 0:
-                result.loc[sea_mask, 'risk_class'] = 'Water'
-                result.loc[sea_mask, 'risk_score'] = 0.0
-                result.loc[sea_mask, 'water_mask_reason'] = 'elevation'
-                logger.info('Elevation fallback: %d cells -> Water.', int(sea_mask.sum()))
+                logger.warning("OSM coverage mask failed: %s", exc)
 
         # Steps 3 & 4: proximity boost and coastal flag
         if not boost_geoms:
             return result
         try:
-            import geopandas as _gpd2
             boost_union_m = unary_union(
-                _gpd2.GeoDataFrame(geometry=boost_geoms, crs='EPSG:4326')
-                .to_crs('EPSG:3857').geometry.tolist()
+                _gpd.GeoDataFrame(geometry=boost_geoms, crs="EPSG:4326")
+                .to_crs("EPSG:3857").geometry.tolist()
             )
             ocean_union_m = None
             if ocean_area_geoms:
                 ocean_union_m = unary_union(
-                    _gpd2.GeoDataFrame(geometry=ocean_area_geoms, crs='EPSG:4326')
-                    .to_crs('EPSG:3857').geometry.tolist()
+                    _gpd.GeoDataFrame(geometry=ocean_area_geoms, crs="EPSG:4326")
+                    .to_crs("EPSG:3857").geometry.tolist()
                 )
             centroid_pts_m = gpd.GeoSeries(
                 [Point(r.centroid_lon, r.centroid_lat) for _, r in result.iterrows()],
-                crs='EPSG:4326',
-            ).to_crs('EPSG:3857')
+                crs="EPSG:4326",
+            ).to_crs("EPSG:3857")
             proximity_m = config.cell_size_meters * 0.6
-            now_water = result['risk_class'].values == 'Water'
+            now_water = result["risk_class"].values == "Water"
             proximity = np.zeros(len(result), dtype=bool)
             for i, pt in enumerate(centroid_pts_m):
                 if not now_water[i]:
@@ -452,26 +379,26 @@ class FloodRiskPipeline:
                     except Exception:
                         pass
             boost_floor = config.low_threshold + 5.0
-            current = result.loc[proximity, 'risk_score'].values
-            result.loc[proximity, 'risk_score'] = np.maximum(current, boost_floor)
+            current = result.loc[proximity, "risk_score"].values
+            result.loc[proximity, "risk_score"] = np.maximum(current, boost_floor)
             for idx in result.index[proximity]:
-                s = result.at[idx, 'risk_score']
-                result.at[idx, 'risk_class'] = 'High' if s > config.medium_threshold else 'Medium'
+                s = result.at[idx, "risk_score"]
+                result.at[idx, "risk_class"] = "High" if s > config.medium_threshold else "Medium"
             if ocean_union_m is not None:
                 coastal_m = config.cell_size_meters * 1.5
-                now_water2 = result['risk_class'].values == 'Water'
+                now_water2 = result["risk_class"].values == "Water"
                 for i, pt in enumerate(centroid_pts_m):
                     if not now_water2[i]:
                         try:
                             if pt.distance(ocean_union_m) <= coastal_m:
-                                result.iloc[i, result.columns.get_loc('is_coastal_tsunami_risk')] = True
+                                result.iloc[i, result.columns.get_loc("is_coastal_tsunami_risk")] = True
                         except Exception:
                             pass
-            logger.info('Water mask done: %d Water, %d coastal.',
-                        int((result['risk_class']=='Water').sum()),
-                        int(result['is_coastal_tsunami_risk'].sum()))
+            logger.info("Water mask done: %d Water, %d coastal.",
+                        int((result["risk_class"] == "Water").sum()),
+                        int(result["is_coastal_tsunami_risk"].sum()))
         except Exception as exc:
-            logger.warning('Proximity/coastal step failed: %s', exc)
+            logger.warning("Proximity/coastal step failed: %s", exc)
         return result
 
     def run_stage(self, stage_name: str, *args: Any, **kwargs: Any) -> Any:

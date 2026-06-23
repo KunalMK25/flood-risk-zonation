@@ -234,3 +234,126 @@ def generate_synthetic_elevation(
         nodata=None,
         source="synthetic",
     )
+
+
+def fetch_elevation_api(
+    bounding_box: BoundingBox,
+    resolution_m: float = 500.0,
+    timeout: int = 15,
+) -> RasterDataset | None:
+    """
+    Fetch SRTM elevation from the OpenTopoData API for any bbox worldwide.
+
+    Returns a RasterDataset with real elevation values (ocean = 0 or NaN),
+    or None if the request fails or times out.
+
+    Ocean pixels in SRTM are returned as 0 by OpenTopoData, making them
+    easily distinguishable from land (typically > 0 m).
+
+    Parameters
+    ----------
+    bounding_box : BoundingBox
+        Geographic extent.
+    resolution_m : float
+        Sampling resolution in metres. Coarser = fewer API points = faster.
+    timeout : int
+        Request timeout in seconds.
+    """
+    try:
+        import requests
+        from math import cos, radians, ceil
+        from rasterio.transform import from_bounds as _from_bounds
+        from rasterio.crs import CRS
+
+        # Build a regular grid of sample points
+        center_lat = (bounding_box.min_lat + bounding_box.max_lat) / 2.0
+        deg_per_m_lat = 1.0 / 111_320.0
+        deg_per_m_lon = 1.0 / (111_320.0 * cos(radians(center_lat)))
+
+        step_lat = resolution_m * deg_per_m_lat
+        step_lon = resolution_m * deg_per_m_lon
+
+        lats = np.arange(bounding_box.min_lat, bounding_box.max_lat, step_lat)
+        lons = np.arange(bounding_box.min_lon, bounding_box.max_lon, step_lon)
+
+        if len(lats) == 0 or len(lons) == 0:
+            return None
+
+        # Limit to 100 points to stay within API free tier
+        max_pts = 100
+        step_r = max(1, len(lats) * len(lons) // max_pts)
+        points = [
+            (lat, lon)
+            for i, lat in enumerate(lats)
+            for j, lon in enumerate(lons)
+            if (i * len(lons) + j) % step_r == 0
+        ][:max_pts]
+
+        if not points:
+            return None
+
+        # Query OpenTopoData SRTM30m dataset
+        locations = "|".join(f"{lat},{lon}" for lat, lon in points)
+        url = f"https://api.opentopodata.org/v1/srtm30m?locations={locations}"
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            logger.warning("OpenTopoData API returned %d", resp.status_code)
+            return None
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+
+        # Build a coarse elevation array from returned points
+        nrows = len(lats)
+        ncols = len(lons)
+        array = np.full((nrows, ncols), np.nan, dtype=np.float32)
+
+        for res in results:
+            lat = res.get("location", {}).get("lat")
+            lon = res.get("location", {}).get("lng")
+            elev = res.get("elevation")
+            if lat is None or lon is None or elev is None:
+                continue
+            # Find nearest row/col
+            r = int(round((lat - bounding_box.min_lat) / step_lat))
+            c = int(round((lon - bounding_box.min_lon) / step_lon))
+            if 0 <= r < nrows and 0 <= c < ncols:
+                array[r, c] = float(elev) if elev is not None else 0.0
+
+        # Fill NaN with nearest valid value using simple propagation
+        from scipy.ndimage import generic_filter
+        mask_nan = np.isnan(array)
+        if mask_nan.any() and not mask_nan.all():
+            # Fill NaNs with column/row median
+            col_medians = np.nanmedian(array, axis=0)
+            for c in range(ncols):
+                nan_rows = np.where(np.isnan(array[:, c]))[0]
+                if len(nan_rows) > 0:
+                    array[nan_rows, c] = col_medians[c] if not np.isnan(col_medians[c]) else 0.0
+        # Replace any remaining NaN with 0 (ocean)
+        array = np.where(np.isnan(array), 0.0, array).astype(np.float32)
+
+        transform = _from_bounds(
+            bounding_box.min_lon, bounding_box.min_lat,
+            bounding_box.max_lon, bounding_box.max_lat,
+            ncols, nrows,
+        )
+
+        logger.info(
+            "OpenTopoData SRTM fetched: %d points, elevation range %.0f–%.0f m",
+            len(results), float(array.min()), float(array.max()),
+        )
+
+        return RasterDataset(
+            array=array,
+            transform=transform,
+            crs=CRS.from_epsg(4326),
+            nodata=None,
+            source="opentopodata_srtm",
+        )
+
+    except Exception as exc:
+        logger.warning("OpenTopoData API fetch failed: %s", exc)
+        return None

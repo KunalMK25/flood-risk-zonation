@@ -405,6 +405,7 @@ if run_button:
                 from flood_risk_zonation.ingest.elevation import (
                     load_elevation,
                     generate_synthetic_elevation,
+                    fetch_elevation_api,
                 )
                 from pathlib import Path as _Path
 
@@ -415,6 +416,10 @@ if run_button:
                         elevation = load_elevation(bbox, elev_dir)
                     except FloodRiskError:
                         pass
+                # Fallback 1: OpenTopoData SRTM API (ocean = 0m, land > 0)
+                if elevation is None:
+                    elevation = fetch_elevation_api(bbox, resolution_m=500)
+                # Fallback 2: synthetic
                 if elevation is None:
                     elevation = generate_synthetic_elevation(
                         bbox, resolution_m=500, seed=config.random_seed
