@@ -359,6 +359,9 @@ class FloodRiskPipeline:
             # (lake surfaces also return 0m in SRTM — handled by OSM polygon mask)
 
         # Step 2: OSM polygon coverage mask (lakes, ponds, reservoirs)
+        # Use 80% threshold for inland water bodies to avoid false masking
+        # of cells where a small pond or canal clips the cell edge.
+        # Use 60% threshold only for large confirmed water bodies (bay, sea, ocean).
         if area_water_geoms:
             try:
                 water_union_4326 = unary_union(area_water_geoms)
@@ -368,6 +371,14 @@ class FloodRiskPipeline:
                 already_water = result["risk_class"].values == "Water"
                 coverage_pct = np.zeros(len(result), dtype=float)
                 coverage_water = np.zeros(len(result), dtype=bool)
+
+                # Also build ocean-only union for lower threshold
+                ocean_union_4326 = unary_union(ocean_area_geoms) if ocean_area_geoms else None
+                ocean_union_m = None
+                if ocean_union_4326 is not None:
+                    _odf = _gpd.GeoDataFrame(geometry=[ocean_union_4326], crs="EPSG:4326")
+                    ocean_union_m = _odf.to_crs("EPSG:3857").geometry.iloc[0]
+
                 for i, cell_geom in enumerate(grid_m.geometry):
                     if already_water[i] or cell_geom is None or cell_geom.is_empty:
                         continue
@@ -377,8 +388,16 @@ class FloodRiskPipeline:
                             continue
                         pct = inter.area / cell_geom.area if cell_geom.area > 0 else 0
                         coverage_pct[i] = pct
-                        if pct >= 0.60:
-                            coverage_water[i] = True
+                        # Lower threshold (60%) for ocean/bay/sea polygons
+                        # Higher threshold (80%) for inland water bodies (ponds, tanks)
+                        if ocean_union_m is not None:
+                            ocean_inter = cell_geom.intersection(ocean_union_m)
+                            ocean_pct = ocean_inter.area / cell_geom.area if cell_geom.area > 0 else 0
+                            if ocean_pct >= 0.60 or (pct - ocean_pct) >= 0.80:
+                                coverage_water[i] = True
+                        else:
+                            if pct >= 0.80:
+                                coverage_water[i] = True
                     except Exception:
                         continue
                 if coverage_water.any():
