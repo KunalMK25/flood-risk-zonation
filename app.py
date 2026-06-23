@@ -38,12 +38,13 @@ st.set_page_config(
 # Bbox coords are rounded to 4 dp before use so that tiny float jitter from
 # the number_input widgets doesn't bust the cache on every rerender.
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def _cached_fetch_water_bodies(
     min_lon: float,
     min_lat: float,
     max_lon: float,
     max_lat: float,
+    _cache_version: int = 3,  # increment to bust stale cache
 ) -> gpd.GeoDataFrame:
     """Cached thin wrapper around load_water_bodies."""
     from flood_risk_zonation.ingest.water_bodies import load_water_bodies
@@ -432,6 +433,7 @@ if run_button:
                     round(bbox.min_lat, 4),
                     round(bbox.max_lon, 4),
                     round(bbox.max_lat, 4),
+                    3,
                 )
                 # Check if fallback was triggered
                 if water_bodies.attrs.get("source") == "fallback":
