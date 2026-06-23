@@ -118,7 +118,17 @@ resolution_label = st.sidebar.selectbox(
 cell_size = resolution_map[resolution_label]
 
 st.sidebar.subheader("Method")
-st.sidebar.caption("Transparent weighted susceptibility index")
+method_choice = st.sidebar.radio(
+    "Susceptibility Model",
+    ["Weighted Index (WSI)", "Random Forest (ML)"],
+    index=0,
+    help=(
+        "WSI: transparent weighted index, instant results.\n"
+        "RF: Random Forest trained on WSI pseudo-labels via 5-fold CV — "
+        "shows AUC & F1 after each run."
+    ),
+)
+use_rf_model = method_choice == "Random Forest (ML)"
 
 st.sidebar.subheader("Classification Thresholds")
 low_threshold = st.sidebar.slider("Low / Medium boundary", 10.0, 49.0, 33.0, 1.0)
@@ -170,6 +180,7 @@ if run_button:
 
         config = PipelineConfig(
             cell_size_meters=float(cell_size),
+            model_type="random_forest" if use_rf_model else "weighted_susceptibility",
             rf_n_estimators=100,
             low_threshold=float(low_threshold),
             medium_threshold=float(medium_threshold),
@@ -237,17 +248,45 @@ if run_button:
 
                 st.write("🤖 Running susceptibility model…")
                 X = featured_grid[FEATURE_COLUMNS].copy()
-                model = WeightedSusceptibilityModel().fit(X)
-                analysis_result = AnalysisResult(
-                    model=model,
-                    feature_names=list(model.feature_names),
-                    feature_importances=model.feature_importances,
-                    method="weighted_susceptibility_index",
-                    validation_note=(
-                        "Relative susceptibility index; not calibrated against "
-                        "observed flood events."
-                    ),
+                from flood_risk_zonation.scoring.susceptibility import (
+                    WeightedSusceptibilityModel,
+                    RandomForestSusceptibilityModel,
                 )
+                if use_rf_model:
+                    model = RandomForestSusceptibilityModel(
+                        n_estimators=100,
+                        cv_folds=5,
+                        random_state=config.random_seed,
+                    ).fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model,
+                        feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances,
+                        method="random_forest",
+                        validation_note=(
+                            f"Random Forest trained on WSI pseudo-labels. "
+                            f"5-fold CV — AUC: {model.mean_cv_auc:.3f}, "
+                            f"F1: {model.mean_cv_f1:.3f}. "
+                            "Labels derived from Weighted Susceptibility Index; not calibrated "
+                            "against observed flood events."
+                        ),
+                        mean_cv_auc=model.mean_cv_auc,
+                        mean_cv_f1=model.mean_cv_f1,
+                        cv_auc_scores=model.cv_auc_scores,
+                        cv_f1_scores=model.cv_f1_scores,
+                    )
+                else:
+                    model = WeightedSusceptibilityModel().fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model,
+                        feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances,
+                        method="weighted_susceptibility_index",
+                        validation_note=(
+                            "Relative susceptibility index; not calibrated against "
+                            "observed flood events."
+                        ),
+                    )
 
                 st.write("🗺️ Scoring and rendering map…")
                 scorer = FloodRiskScorer()
@@ -384,17 +423,45 @@ if run_button:
 
                 st.write("🤖 Running susceptibility model…")
                 X = featured_grid[FEATURE_COLUMNS].copy()
-                model = WeightedSusceptibilityModel().fit(X)
-                analysis_result = AnalysisResult(
-                    model=model,
-                    feature_names=list(model.feature_names),
-                    feature_importances=model.feature_importances,
-                    method="weighted_susceptibility_index",
-                    validation_note=(
-                        "Relative susceptibility index; not calibrated against "
-                        "observed flood events."
-                    ),
+                from flood_risk_zonation.scoring.susceptibility import (
+                    WeightedSusceptibilityModel as _WSI,
+                    RandomForestSusceptibilityModel as _RF,
                 )
+                if use_rf_model:
+                    model = _RF(
+                        n_estimators=100,
+                        cv_folds=5,
+                        random_state=config.random_seed,
+                    ).fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model,
+                        feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances,
+                        method="random_forest",
+                        validation_note=(
+                            f"Random Forest trained on WSI pseudo-labels. "
+                            f"5-fold CV — AUC: {model.mean_cv_auc:.3f}, "
+                            f"F1: {model.mean_cv_f1:.3f}. "
+                            "Labels derived from Weighted Susceptibility Index; not calibrated "
+                            "against observed flood events."
+                        ),
+                        mean_cv_auc=model.mean_cv_auc,
+                        mean_cv_f1=model.mean_cv_f1,
+                        cv_auc_scores=model.cv_auc_scores,
+                        cv_f1_scores=model.cv_f1_scores,
+                    )
+                else:
+                    model = _WSI().fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model,
+                        feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances,
+                        method="weighted_susceptibility_index",
+                        validation_note=(
+                            "Relative susceptibility index; not calibrated against "
+                            "observed flood events."
+                        ),
+                    )
 
                 st.write("🗺️ Scoring and rendering map…")
                 scorer = FloodRiskScorer()
@@ -564,6 +631,21 @@ with tab3:
         st.pyplot(fig)
         plt.close(fig)
         st.caption(result.analysis_result.validation_note)
+
+        # Show CV metrics if RF was used
+        ar = result.analysis_result
+        if ar.method == "random_forest" and ar.mean_cv_auc is not None:
+            st.markdown("**Cross-Validation Results (5-fold stratified)**")
+            col_m1, col_m2 = st.columns(2)
+            col_m1.metric("Mean AUC-ROC", f"{ar.mean_cv_auc:.3f}")
+            col_m2.metric("Mean F1 Score", f"{ar.mean_cv_f1:.3f}")
+            if ar.cv_auc_scores:
+                fold_df = pd.DataFrame({
+                    "Fold": [f"Fold {i+1}" for i in range(len(ar.cv_auc_scores))],
+                    "AUC": [f"{v:.3f}" for v in ar.cv_auc_scores],
+                    "F1":  [f"{v:.3f}" for v in (ar.cv_f1_scores or [])],
+                })
+                st.dataframe(fold_df, use_container_width=True, hide_index=True)
     else:
         st.info("Run the analysis first.")
 

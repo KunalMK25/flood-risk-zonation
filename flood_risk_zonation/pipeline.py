@@ -25,7 +25,7 @@ from flood_risk_zonation.ingest.rainfall import generate_synthetic_rainfall
 from flood_risk_zonation.ingest.water_bodies import load_water_bodies
 from flood_risk_zonation.models import AnalysisResult, FloodRiskResult
 from flood_risk_zonation.scoring.scorer import FloodRiskScorer
-from flood_risk_zonation.scoring.susceptibility import WeightedSusceptibilityModel
+from flood_risk_zonation.scoring.susceptibility import WeightedSusceptibilityModel, RandomForestSusceptibilityModel
 from flood_risk_zonation.utils.cache import cache_key, get_cache_path, is_cached, load_geodataframe, save_geodataframe
 from flood_risk_zonation.utils.validation import validate_bounding_box, validate_config
 
@@ -141,20 +141,49 @@ class FloodRiskPipeline:
             grid, elevation, rainfall, water_bodies, population, drainage
         )
 
-        # --- Transparent susceptibility model ---
-        # No target labels are fabricated from the input features. The result is
-        # explicitly a relative index whose weights and directions are inspectable.
+        # --- Susceptibility model ---
+        # WSI (default): transparent weighted index, no training data needed.
+        # RF: Random Forest trained on WSI pseudo-labels with 5-fold CV.
         X = featured_grid[FEATURE_COLUMNS].copy()
-        model = WeightedSusceptibilityModel().fit(X)
-        analysis_result = AnalysisResult(
-            model=model,
-            feature_names=list(model.feature_names),
-            feature_importances=model.feature_importances,
-            method="weighted_susceptibility_index",
-            validation_note=(
-                "Relative susceptibility index; not calibrated against observed flood events."
-            ),
-        )
+        use_rf = getattr(config, "model_type", "weighted_susceptibility") == "random_forest"
+
+        if use_rf:
+            logger.info("Training Random Forest susceptibility model…")
+            model = RandomForestSusceptibilityModel(
+                n_estimators=config.rf_n_estimators,
+                cv_folds=config.cv_folds,
+                random_state=config.random_seed,
+            ).fit(X)
+            analysis_result = AnalysisResult(
+                model=model,
+                feature_names=list(model.feature_names),
+                feature_importances=model.feature_importances,
+                method="random_forest",
+                validation_note=(
+                    f"Random Forest trained on WSI pseudo-labels. "
+                    f"5-fold CV — AUC: {model.mean_cv_auc:.3f}, F1: {model.mean_cv_f1:.3f}. "
+                    "Labels derived from Weighted Susceptibility Index; not calibrated "
+                    "against observed flood events."
+                ),
+                mean_cv_auc=model.mean_cv_auc,
+                mean_cv_f1=model.mean_cv_f1,
+                cv_auc_scores=model.cv_auc_scores,
+                cv_f1_scores=model.cv_f1_scores,
+            )
+        else:
+            # Transparent susceptibility model (default)
+            # No target labels are fabricated from the input features. The result is
+            # explicitly a relative index whose weights and directions are inspectable.
+            model = WeightedSusceptibilityModel().fit(X)
+            analysis_result = AnalysisResult(
+                model=model,
+                feature_names=list(model.feature_names),
+                feature_importances=model.feature_importances,
+                method="weighted_susceptibility_index",
+                validation_note=(
+                    "Relative susceptibility index; not calibrated against observed flood events."
+                ),
+            )
 
         # --- Risk scoring ---
         logger.info("Scoring grid…")
