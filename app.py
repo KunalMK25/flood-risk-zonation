@@ -65,54 +65,105 @@ def _cached_fetch_water_bodies(
 st.sidebar.title("🌊 Flood Risk Zonation")
 st.sidebar.markdown("---")
 
-# ── Offline sample data ──────────────────────────────────────────────────────
-st.sidebar.subheader("Demo Mode")
-use_offline = st.sidebar.checkbox(
-    "Use offline sample data",
-    value=False,
-    help=(
-        "Load pre-defined synthetic data for a demo region instead of hitting "
-        "live APIs. Reliable for demos — no network required."
-    ),
+# ── Region Selection ─────────────────────────────────────────────────────────
+# All 4 preset regions + a "Custom" option for manual bbox entry.
+# Offline sample data is enabled automatically for the 3 bundled demo regions.
+
+PRESET_REGIONS = {
+    "Gottigere, Bangalore": {
+        "min_lon": 77.55, "min_lat": 12.84, "max_lon": 77.62, "max_lat": 12.91,
+        "area_name": "Gottigere, Bangalore",
+        "offline_key": "Bangalore (Gottigere)",   # matches DEMO_REGIONS key
+    },
+    "Chennai Marina (Coastal)": {
+        "min_lon": 80.24, "min_lat": 12.98, "max_lon": 80.31, "max_lat": 13.05,
+        "area_name": "Chennai Marina, Chennai",
+        "offline_key": "Chennai Marina (Coastal)",
+    },
+    "Dal Lake, Srinagar": {
+        "min_lon": 74.83, "min_lat": 34.07, "max_lon": 74.90, "max_lat": 34.14,
+        "area_name": "Dal Lake, Srinagar",
+        "offline_key": "Dal Lake, Srinagar",
+    },
+    "Puri, Odisha (Cyclone Coast)": {
+        "min_lon": 85.80, "min_lat": 19.77, "max_lon": 85.87, "max_lat": 19.84,
+        "area_name": "Puri, Odisha",
+        "offline_key": None,                       # no bundled offline data — uses live API
+    },
+    "✏️ Custom Region": {
+        "min_lon": 77.55, "min_lat": 12.84, "max_lon": 77.62, "max_lat": 12.91,
+        "area_name": "",
+        "offline_key": None,
+    },
+}
+
+st.sidebar.subheader("Region Selection")
+selected_preset = st.sidebar.selectbox(
+    "Select Region",
+    list(PRESET_REGIONS.keys()),
+    index=0,
+    help="Choose a preset region or select '✏️ Custom Region' to enter coordinates manually.",
 )
 
-offline_region: DemoRegion | None = None
-if use_offline:
-    region_name = st.sidebar.selectbox(
-        "Demo region",
-        list(DEMO_REGIONS.keys()),
-        index=0,
+preset = PRESET_REGIONS[selected_preset]
+is_custom = selected_preset == "✏️ Custom Region"
+
+# Determine offline mode: auto-enable for regions that have bundled demo data
+offline_key = preset["offline_key"]
+has_offline = offline_key is not None and offline_key in DEMO_REGIONS
+
+if has_offline:
+    use_offline = st.sidebar.checkbox(
+        "📦 Use offline sample data",
+        value=False,
+        help="Use pre-bundled synthetic data — no network required. Good for demos.",
     )
-    offline_region = DEMO_REGIONS[region_name]
+else:
+    use_offline = False
+
+offline_region: DemoRegion | None = None
+if use_offline and has_offline:
+    offline_region = DEMO_REGIONS[offline_key]
     st.sidebar.info(
-        f"📦 Offline mode — pre-fetched data for **{region_name}**. "
-        "Bbox fields below are ignored."
+        f"📦 Offline mode active — using pre-bundled data for **{selected_preset}**."
     )
 
 st.sidebar.markdown("---")
 
-# ── Region Selection ─────────────────────────────────────────────────────────
-st.sidebar.subheader("Region Selection")
+# ── Bbox inputs — pre-filled from preset, editable only in Custom mode ────────
 area_name_input = st.sidebar.text_input(
-    "Area Name (for PDF report)", value="Gottigere, Bangalore"
+    "Area Name (for PDF report)",
+    value=preset["area_name"] if not is_custom else "",
+    disabled=not is_custom,
 )
+
 col1, col2 = st.sidebar.columns(2)
 min_lon = col1.number_input(
-    "Min Lon", value=77.55, min_value=-180.0, max_value=180.0, step=0.01,
-    disabled=use_offline,
+    "Min Lon", value=float(preset["min_lon"]),
+    min_value=-180.0, max_value=180.0, step=0.01,
+    disabled=not is_custom or use_offline,
 )
 min_lat = col2.number_input(
-    "Min Lat", value=12.84, min_value=-90.0, max_value=90.0, step=0.01,
-    disabled=use_offline,
+    "Min Lat", value=float(preset["min_lat"]),
+    min_value=-90.0, max_value=90.0, step=0.01,
+    disabled=not is_custom or use_offline,
 )
 max_lon = col1.number_input(
-    "Max Lon", value=77.62, min_value=-180.0, max_value=180.0, step=0.01,
-    disabled=use_offline,
+    "Max Lon", value=float(preset["max_lon"]),
+    min_value=-180.0, max_value=180.0, step=0.01,
+    disabled=not is_custom or use_offline,
 )
 max_lat = col2.number_input(
-    "Max Lat", value=12.91, min_value=-90.0, max_value=90.0, step=0.01,
-    disabled=use_offline,
+    "Max Lat", value=float(preset["max_lat"]),
+    min_value=-90.0, max_value=90.0, step=0.01,
+    disabled=not is_custom or use_offline,
 )
+
+if not is_custom and not use_offline:
+    st.sidebar.caption(
+        f"📍 Preset coordinates for **{selected_preset}**. "
+        "Select '✏️ Custom Region' to enter your own."
+    )
 
 st.sidebar.subheader("Grid Resolution")
 resolution_map = {"250m": 250, "500m": 500, "1000m": 1000}
@@ -735,8 +786,10 @@ with tab4:
                         )
 
                         area_name = (
-                            area_name_input
+                            area_name_input.strip()
                             if area_name_input.strip()
+                            else preset["area_name"]
+                            if preset["area_name"]
                             else (
                                 f"Lat {result.bounding_box.min_lat:.3f}–"
                                 f"{result.bounding_box.max_lat:.3f}, "
