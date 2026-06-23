@@ -105,21 +105,19 @@ class TestWaterMaskingHardOverride:
         )
 
     def test_elevation_mask_fires_for_low_elevation(self):
-        """Cells with elevation ≤ 2 m near a coastline get Water class."""
-        # Two cells: one ocean (0.5 m), one land (50 m)
-        # A coastline LineString is provided so the elevation mask activates
+        """Cells with elevation == 0 m near a coastline get Water class (SRTM ocean = 0m)."""
         from shapely.geometry import LineString
-        grid = _make_grid([77.55, 77.56], [12.84, 12.84], [0.5, 50.0])
-        # Coastline just south of the cells
+        grid = _make_grid([77.55, 77.56], [12.84, 12.84], [0.0, 50.0])
+        # Coastline very close to the cell (within 2x cell_size)
         coastline_gdf = gpd.GeoDataFrame(
-            {"geometry": [LineString([(77.50, 12.83), (77.60, 12.83)])],
+            {"geometry": [LineString([(77.50, 12.838), (77.60, 12.838)])],
              "water_type": ["coastline"], "name": [""]},
             crs="EPSG:4326",
         )
         result = _pipeline()._apply_water_mask_and_proximity_boost(
             grid, coastline_gdf, _config(cell_size=500.0), elevation_source="real"
         )
-        assert result.iloc[0]["risk_class"] == "Water", "0.5 m cell near coastline must be masked as Water"
+        assert result.iloc[0]["risk_class"] == "Water", "0 m cell near coastline must be masked as Water"
         assert result.iloc[1]["risk_class"] != "Water", "50 m cell must remain land"
         assert result.iloc[0]["risk_class"] == "Water", "0.5 m cell must be masked as Water"
         assert result.iloc[1]["risk_class"] != "Water", "50 m cell must remain land"

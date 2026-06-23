@@ -335,7 +335,7 @@ class FloodRiskPipeline:
                                 coastline_geoms_m.append(g if g.is_valid else g.buffer(0))
                     if coastline_geoms_m:
                         coast_union_m = unary_union(coastline_geoms_m)
-                        coast_proximity_m = config.cell_size_meters * 4.0
+                        coast_proximity_m = config.cell_size_meters * 2.0
                         centroid_pts_coast = _gpd.GeoSeries(
                             [Point(r.centroid_lon, r.centroid_lat) for _, r in result.iterrows()],
                             crs="EPSG:4326",
@@ -344,7 +344,9 @@ class FloodRiskPipeline:
                             pt.distance(coast_union_m) <= coast_proximity_m
                             for pt in centroid_pts_coast
                         ])
-                        sea_mask = (result["elevation_m"].values <= 2.0) & near_coast
+                        # Threshold: 0m = SRTM ocean surface. Low coastal land
+                        # (1-5m) is NOT masked as Water — only true ocean pixels (0m).
+                        sea_mask = (result["elevation_m"].values <= 0.0) & near_coast
                         n_sea = int(sea_mask.sum())
                         if n_sea > 0:
                             result.loc[sea_mask, "risk_class"] = "Water"
