@@ -1,8 +1,8 @@
 """
 Flood-susceptibility models for the Flood Risk Zonation System.
+v2 — WeightedSusceptibilityModel + RandomForestSusceptibilityModel
 
 Two models are provided:
-
 WeightedSusceptibilityModel
     Transparent, deterministic weighted index (MCDA/WLC approach).
     No training data required. Weights and directions are declared explicitly.

@@ -19,6 +19,10 @@ from flood_risk_zonation.exceptions import FloodRiskError
 from flood_risk_zonation.features.extractor import FEATURE_COLUMNS
 from flood_risk_zonation.ingest.sample_data import DEMO_REGIONS, DemoRegion
 from flood_risk_zonation.pipeline import FloodRiskPipeline
+from flood_risk_zonation.scoring.susceptibility import (
+    WeightedSusceptibilityModel,
+    RandomForestSusceptibilityModel,  # noqa: F401 — ensure module is loaded
+)
 from flood_risk_zonation.visualization.map_builder import FloodRiskMapBuilder
 
 logging.basicConfig(level=logging.INFO)
