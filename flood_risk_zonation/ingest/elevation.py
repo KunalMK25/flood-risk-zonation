@@ -322,18 +322,18 @@ def fetch_elevation_api(
             if 0 <= r < nrows and 0 <= c < ncols:
                 array[r, c] = float(elev) if elev is not None else 0.0
 
-        # Fill NaN with nearest valid value using simple propagation
-        from scipy.ndimage import generic_filter
+        # Fill NaN with nearest valid value - use high value (not 0!) to avoid
+        # treating unsampled cells as ocean
         mask_nan = np.isnan(array)
         if mask_nan.any() and not mask_nan.all():
-            # Fill NaNs with column/row median
             col_medians = np.nanmedian(array, axis=0)
             for c in range(ncols):
                 nan_rows = np.where(np.isnan(array[:, c]))[0]
                 if len(nan_rows) > 0:
-                    array[nan_rows, c] = col_medians[c] if not np.isnan(col_medians[c]) else 0.0
-        # Replace any remaining NaN with 0 (ocean)
-        array = np.where(np.isnan(array), 0.0, array).astype(np.float32)
+                    fill = col_medians[c] if not np.isnan(col_medians[c]) else 100.0
+                    array[nan_rows, c] = fill
+        # Replace any remaining NaN with 100m (safe default — won't trigger ocean mask)
+        array = np.where(np.isnan(array), 100.0, array).astype(np.float32)
 
         transform = _from_bounds(
             bounding_box.min_lon, bounding_box.min_lat,

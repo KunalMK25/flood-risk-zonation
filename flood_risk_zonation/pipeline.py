@@ -306,17 +306,55 @@ class FloodRiskPipeline:
                     elif wtype not in LINEAR_TYPES:
                         area_water_geoms.append(geom)
 
-        # Step 1: elevation mask (primary ocean detector)
+        # Step 1: elevation mask (ocean detector)
         # Real SRTM via OpenTopoData returns ocean pixels as 0 m.
+        # CRITICAL guards:
+        # (a) Only apply if OSM coastline data is present nearby — prevents
+        #     inland low-lying land (Adyar ~1m) from being falsely masked.
+        # (b) For Dal Lake and similar: SRTM also returns 0m for lake surfaces.
+        #     These are correctly handled by the OSM polygon coverage mask (step 2).
+        #     The elevation mask should only fire for ocean, not for lake surfaces.
+        #     We detect this by requiring the cell to be near a coastline feature.
         synthetic_sources = {"synthetic", "offline_sample"}
-        if elevation_source not in synthetic_sources and "elevation_m" in result.columns:
-            sea_mask = result["elevation_m"].values <= 2.0
-            n_sea = int(sea_mask.sum())
-            if n_sea > 0:
-                result.loc[sea_mask, "risk_class"] = "Water"
-                result.loc[sea_mask, "risk_score"] = 0.0
-                result.loc[sea_mask, "water_mask_reason"] = "elevation"
-                logger.info("Elevation mask: %d cells (elev <= 2 m) -> Water.", n_sea)
+        if elevation_source not in synthetic_sources and "elevation_m" in result.columns and boost_geoms:
+            has_coastline = False
+            if water_bodies is not None and len(water_bodies) > 0:
+                for _, row in water_bodies.iterrows():
+                    if str(row.get("water_type", "")).lower() in {"coastline", "bay", "sea", "ocean"}:
+                        has_coastline = True
+                        break
+            if has_coastline:
+                # Only mask low-elevation cells that are near a coastline feature
+                try:
+                    coastline_geoms_m = []
+                    wb_m_coast = water_bodies.to_crs("EPSG:3857")
+                    for _, row in wb_m_coast.iterrows():
+                        if str(row.get("water_type", "")).lower() in {"coastline", "bay", "sea", "ocean"}:
+                            g = row.geometry
+                            if g is not None and not g.is_empty:
+                                coastline_geoms_m.append(g if g.is_valid else g.buffer(0))
+                    if coastline_geoms_m:
+                        coast_union_m = unary_union(coastline_geoms_m)
+                        coast_proximity_m = config.cell_size_meters * 4.0
+                        centroid_pts_coast = _gpd.GeoSeries(
+                            [Point(r.centroid_lon, r.centroid_lat) for _, r in result.iterrows()],
+                            crs="EPSG:4326",
+                        ).to_crs("EPSG:3857")
+                        near_coast = np.array([
+                            pt.distance(coast_union_m) <= coast_proximity_m
+                            for pt in centroid_pts_coast
+                        ])
+                        sea_mask = (result["elevation_m"].values <= 2.0) & near_coast
+                        n_sea = int(sea_mask.sum())
+                        if n_sea > 0:
+                            result.loc[sea_mask, "risk_class"] = "Water"
+                            result.loc[sea_mask, "risk_score"] = 0.0
+                            result.loc[sea_mask, "water_mask_reason"] = "elevation"
+                            logger.info("Elevation+coastline mask: %d cells -> Water.", n_sea)
+                except Exception as exc:
+                    logger.warning("Elevation+coastline mask failed: %s", exc)
+            # No coastline: do NOT apply elevation mask at all
+            # (lake surfaces also return 0m in SRTM — handled by OSM polygon mask)
 
         # Step 2: OSM polygon coverage mask (lakes, ponds, reservoirs)
         if area_water_geoms:
