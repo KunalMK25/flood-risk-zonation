@@ -334,9 +334,15 @@ class FloodRiskPipeline:
                     coast_buf_deg = (config.cell_size_meters * 2) / 111_320.0
                     ocean_polygon = bbox_poly.difference(coast_union.buffer(coast_buf_deg))
                 if ocean_polygon and not ocean_polygon.is_empty:
-                    area_water_geoms.append(ocean_polygon)
+                    # Use ocean polygon for cell-level Water masking via centroid test
+                    # (not area coverage — area coverage would wrongly mask straddling cells)
+                    # Also used for proximity boost and coastal tsunami flag.
                     ocean_area_geoms.append(ocean_polygon)
                     boost_geoms.append(ocean_polygon)
+                    # Add to area_water_geoms so centroid-in-polygon check runs in Step 1
+                    # BUT with a stricter threshold: cell centroid must be fully inside
+                    # We store it separately so we can use 100% threshold for ocean cells
+                    # (handled below via direct centroid test, not area coverage)
                     logger.info("Ocean polygon built from %d coastline segment(s).", len(coastline_lines))
             except Exception as exc:
                 logger.warning("Ocean polygon construction failed: %s", exc)
@@ -395,6 +401,41 @@ class FloodRiskPipeline:
             except Exception as exc:
                 logger.warning("Coverage mask failed: %s", exc)
                 result["water_coverage_pct"] = 0.0
+
+        # ── Step 1b: Ocean centroid mask ──────────────────────────────────────
+        # For ocean polygon derived from coastline: mark cells whose centroid
+        # lies clearly inside the ocean polygon (not just partially overlapping).
+        # A cell is "clearly ocean" if its centroid is inside AND it is at least
+        # half a cell-size away from the coastline itself — preventing straddling
+        # cells on the coast from being wrongly marked as Water.
+        if ocean_polygon is not None and not ocean_polygon.is_empty:
+            try:
+                import geopandas as _gpd3
+                coast_buf_deg = (config.cell_size_meters * 0.5) / 111_320.0
+                # Shrink ocean polygon inward by half-cell to avoid coast straddlers
+                try:
+                    ocean_shrunk = ocean_polygon.buffer(-coast_buf_deg)
+                except Exception:
+                    ocean_shrunk = ocean_polygon
+                if ocean_shrunk and not ocean_shrunk.is_empty:
+                    ocean_water = np.zeros(len(result), dtype=bool)
+                    already_water = result["risk_class"].values == "Water"
+                    for i, (_, row) in enumerate(result.iterrows()):
+                        if already_water[i]:
+                            continue
+                        pt = Point(row["centroid_lon"], row["centroid_lat"])
+                        try:
+                            if ocean_shrunk.contains(pt):
+                                ocean_water[i] = True
+                        except Exception:
+                            pass
+                    if ocean_water.any():
+                        result.loc[ocean_water, "risk_class"] = "Water"
+                        result.loc[ocean_water, "risk_score"] = 0.0
+                        result.loc[ocean_water, "water_mask_reason"] = "ocean_centroid"
+                        logger.info("Ocean centroid mask: %d cells -> Water.", int(ocean_water.sum()))
+            except Exception as exc:
+                logger.warning("Ocean centroid mask failed: %s", exc)
 
         synthetic_sources = {"synthetic", "offline_sample"}
         apply_elevation_mask = elevation_source not in synthetic_sources
