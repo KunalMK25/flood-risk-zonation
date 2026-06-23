@@ -26,9 +26,8 @@ def test_full_pipeline_synthetic_data():
     assert "risk_class" in result.scored_grid.columns
     assert result.scored_grid["risk_score"].between(0.0, 100.0).all()
     assert set(result.scored_grid["risk_class"].unique()).issubset({"Low", "Medium", "High", "Water"})
-    # Pipeline uses WeightedSusceptibilityModel (not FloodRiskModelTrainer),
-    # so access analysis_result directly rather than the old TrainingResult API.
-    assert result.analysis_result.method == "weighted_susceptibility_index"
+    # Pipeline uses EnsembleSusceptibilityModel by default.
+    assert result.analysis_result.method == "ensemble"
     assert isinstance(result.analysis_result.feature_importances, dict)
     assert len(result.analysis_result.feature_importances) > 0
 

@@ -95,11 +95,17 @@ class AnalysisResult:
     feature_importances: dict[str, float]
     method: str
     validation_note: str
-    # CV metrics — populated when method == "random_forest"
+    # CV metrics — populated for RF and Ensemble methods
     mean_cv_auc: Optional[float] = None
     mean_cv_f1: Optional[float] = None
+    mean_cv_accuracy: Optional[float] = None
+    mean_cv_precision: Optional[float] = None
+    mean_cv_recall: Optional[float] = None
     cv_auc_scores: Optional[list] = None
     cv_f1_scores: Optional[list] = None
+    cv_accuracy_scores: Optional[list] = None
+    cv_precision_scores: Optional[list] = None
+    cv_recall_scores: Optional[list] = None
 
 
 @dataclass

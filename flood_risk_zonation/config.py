@@ -105,7 +105,7 @@ class PipelineConfig:
     """
 
     cell_size_meters: float = 500.0
-    model_type: Literal["random_forest", "lightgbm", "weighted_susceptibility"] = "weighted_susceptibility"
+    model_type: Literal["random_forest", "lightgbm", "weighted_susceptibility", "ensemble"] = "ensemble"
     rf_n_estimators: int = 200
     rf_max_depth: Optional[int] = None
     rf_min_samples_leaf: int = 5

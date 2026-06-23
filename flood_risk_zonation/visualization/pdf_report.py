@@ -424,12 +424,130 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
     story.append(fi_t)
     story.append(PageBreak())
 
-    # NEW: Risk Zone Parameters section
+    # ── Model Performance Metrics ─────────────────────────────────────────────
+    ar = result.analysis_result
+    story.append(Paragraph("6. Model Performance Metrics", styles["SectionHead"]))
+
+    method_labels = {
+        "ensemble": "Ensemble (Weighted Index + Random Forest)",
+        "random_forest": "Random Forest (ML)",
+        "weighted_susceptibility_index": "Weighted Susceptibility Index (MCDA)",
+    }
+    story.append(Paragraph(
+        f"<b>Model:</b> {method_labels.get(ar.method, ar.method)}",
+        styles["Body"],
+    ))
+    story.append(Paragraph(
+        "<b>Training approach:</b> No real flood-event labels are available. "
+        "The top 33% of cells by Weighted Susceptibility Index score are used as "
+        "high-risk pseudo-labels. Metrics are computed via 5-fold stratified "
+        "cross-validation on the same dataset used for scoring.",
+        styles["Body"],
+    ))
+    story.append(Spacer(1, 0.2*cm))
+
+    if ar.method in ("ensemble", "random_forest") and ar.mean_cv_auc is not None:
+        # Summary metrics table
+        metrics_summary = [
+            ["Metric", "Mean (5-fold CV)", "Interpretation"],
+            ["AUC-ROC",
+             f"{ar.mean_cv_auc:.3f}",
+             "Area under ROC curve — 1.0 = perfect, 0.5 = random. Measures ability to rank high-risk cells above low-risk cells."],
+            ["F1 Score",
+             f"{ar.mean_cv_f1:.3f}" if ar.mean_cv_f1 is not None else "—",
+             "Harmonic mean of Precision and Recall — balances false positives and false negatives."],
+            ["Accuracy",
+             f"{ar.mean_cv_accuracy:.3f}" if ar.mean_cv_accuracy is not None else "—",
+             "Fraction of cells correctly classified as high-risk or low-risk."],
+            ["Precision",
+             f"{ar.mean_cv_precision:.3f}" if ar.mean_cv_precision is not None else "—",
+             "Of all cells predicted as high-risk, what fraction actually are? Higher = fewer false alarms."],
+            ["Recall (Sensitivity)",
+             f"{ar.mean_cv_recall:.3f}" if ar.mean_cv_recall is not None else "—",
+             "Of all actual high-risk cells, what fraction were detected? Higher = fewer missed flood zones."],
+        ]
+        ms_t = Table(metrics_summary, colWidths=[4*cm, 3.5*cm, 9.5*cm])
+        ms_t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a5276")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dee2e6")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f8f9fa"), colors.white]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(ms_t)
+        story.append(Spacer(1, 0.3*cm))
+
+        # Per-fold CV table
+        if ar.cv_auc_scores:
+            n_folds = len(ar.cv_auc_scores)
+            story.append(Paragraph("Per-Fold Cross-Validation Results", styles["SectionHead"]))
+            fold_header = ["Fold", "AUC-ROC", "F1 Score", "Accuracy", "Precision", "Recall"]
+            fold_rows = [fold_header]
+            for i in range(n_folds):
+                fold_rows.append([
+                    f"Fold {i+1}",
+                    f"{ar.cv_auc_scores[i]:.3f}",
+                    f"{ar.cv_f1_scores[i]:.3f}" if ar.cv_f1_scores else "—",
+                    f"{ar.cv_accuracy_scores[i]:.3f}" if ar.cv_accuracy_scores else "—",
+                    f"{ar.cv_precision_scores[i]:.3f}" if ar.cv_precision_scores else "—",
+                    f"{ar.cv_recall_scores[i]:.3f}" if ar.cv_recall_scores else "—",
+                ])
+            # Mean row
+            fold_rows.append([
+                "Mean",
+                f"{ar.mean_cv_auc:.3f}",
+                f"{ar.mean_cv_f1:.3f}" if ar.mean_cv_f1 is not None else "—",
+                f"{ar.mean_cv_accuracy:.3f}" if ar.mean_cv_accuracy is not None else "—",
+                f"{ar.mean_cv_precision:.3f}" if ar.mean_cv_precision is not None else "—",
+                f"{ar.mean_cv_recall:.3f}" if ar.mean_cv_recall is not None else "—",
+            ])
+            fold_t = Table(fold_rows, colWidths=[2.5*cm, 2.8*cm, 2.8*cm, 2.8*cm, 2.8*cm, 2.8*cm])
+            fold_style = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dee2e6")),
+                ("PADDING", (0, 0), (-1, -1), 6),
+                ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.HexColor("#f8f9fa"), colors.white]),
+                # Mean row highlighted
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#d4efdf")),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ]
+            fold_t.setStyle(TableStyle(fold_style))
+            story.append(fold_t)
+            story.append(Spacer(1, 0.3*cm))
+
+        story.append(Paragraph(
+            "<i>Note: Metrics are computed on pseudo-labels derived from the Weighted "
+            "Susceptibility Index. They measure how consistently the model identifies "
+            "cells that the domain-expert index considers high-risk — not validation "
+            "against observed flood events. AUC-ROC > 0.85 indicates strong consistency.</i>",
+            styles["Caption"],
+        ))
+    else:
+        story.append(Paragraph(
+            "The Weighted Susceptibility Index is a deterministic formula — traditional "
+            "ML metrics (AUC, F1, Accuracy) do not apply as there is no classifier or "
+            "training process. Run with the Ensemble or Random Forest model to see "
+            "cross-validation metrics.",
+            styles["Body"],
+        ))
+
+    story.append(PageBreak())
+
+    # Risk Zone Parameters section
     for item in _risk_zone_parameters_table(result, styles):
         story.append(item)
     story.append(PageBreak())
 
-    story.append(Paragraph("6. Emergency Services Deployment Plan", styles["SectionHead"]))
+    story.append(Paragraph("7. Emergency Services Deployment Plan", styles["SectionHead"]))
     story.append(Paragraph(
         "The following deployment plan is based on the flood risk zonation results. "
         "Resources should be pre-positioned before monsoon onset (June 1) and maintained "
@@ -484,7 +602,7 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
         ("ROWBACKGROUNDS", (0,1), (0,-1), [colors.HexColor("#f8f9fa"), colors.white]),
     ]))
     story.append(res_t); story.append(Spacer(1, 0.4*cm))
-    story.append(Paragraph("7. Recommendations & Next Steps", styles["SectionHead"]))
+    story.append(Paragraph("8. Recommendations & Next Steps", styles["SectionHead"]))
     # Area-specific recommendations based on actual data
     grid_nw = grid[grid.risk_class != "Water"]
     high_drain = grid_nw[grid_nw.risk_class == "High"]["drainage_capacity"].mean() if dist.get("High", 0) > 0 else 0.5

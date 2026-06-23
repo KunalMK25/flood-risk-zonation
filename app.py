@@ -124,15 +124,20 @@ cell_size = resolution_map[resolution_label]
 st.sidebar.subheader("Method")
 method_choice = st.sidebar.radio(
     "Susceptibility Model",
-    ["Weighted Index (WSI)", "Random Forest (ML)"],
+    ["Ensemble (WSI + RF)", "Weighted Index (WSI)", "Random Forest (ML)"],
     index=0,
     help=(
+        "Ensemble: blends WSI + Random Forest for best results — shows full CV metrics.\n"
         "WSI: transparent weighted index, instant results.\n"
-        "RF: Random Forest trained on WSI pseudo-labels via 5-fold CV — "
-        "shows AUC & F1 after each run."
+        "RF: Random Forest only — shows AUC & F1 after each run."
     ),
 )
-use_rf_model = method_choice == "Random Forest (ML)"
+_model_type_map = {
+    "Ensemble (WSI + RF)": "ensemble",
+    "Weighted Index (WSI)": "weighted_susceptibility",
+    "Random Forest (ML)": "random_forest",
+}
+selected_model_type = _model_type_map[method_choice]
 
 st.sidebar.subheader("Classification Thresholds")
 low_threshold = st.sidebar.slider("Low / Medium boundary", 10.0, 49.0, 33.0, 1.0)
@@ -184,7 +189,7 @@ if run_button:
 
         config = PipelineConfig(
             cell_size_meters=float(cell_size),
-            model_type="random_forest" if use_rf_model else "weighted_susceptibility",
+            model_type=selected_model_type,
             rf_n_estimators=100,
             low_threshold=float(low_threshold),
             medium_threshold=float(medium_threshold),
@@ -255,41 +260,50 @@ if run_button:
                 from flood_risk_zonation.scoring.susceptibility import (
                     WeightedSusceptibilityModel,
                     RandomForestSusceptibilityModel,
+                    EnsembleSusceptibilityModel,
                 )
-                if use_rf_model:
-                    model = RandomForestSusceptibilityModel(
-                        n_estimators=100,
-                        cv_folds=5,
-                        random_state=config.random_seed,
+                if selected_model_type == "ensemble":
+                    model = EnsembleSusceptibilityModel(
+                        n_estimators=100, cv_folds=5, random_state=config.random_seed,
                     ).fit(X)
                     analysis_result = AnalysisResult(
-                        model=model,
-                        feature_names=list(model.feature_names),
-                        feature_importances=model.feature_importances,
-                        method="random_forest",
+                        model=model, feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances, method="ensemble",
                         validation_note=(
-                            f"Random Forest trained on WSI pseudo-labels. "
-                            f"5-fold CV — AUC: {model.mean_cv_auc:.3f}, "
-                            f"F1: {model.mean_cv_f1:.3f}. "
-                            "Labels derived from Weighted Susceptibility Index; not calibrated "
-                            "against observed flood events."
+                            f"Ensemble (WSI + RF). 5-fold CV — "
+                            f"AUC: {model.mean_cv_auc:.3f}, F1: {model.mean_cv_f1:.3f}, "
+                            f"Accuracy: {model.mean_cv_accuracy:.3f}."
                         ),
-                        mean_cv_auc=model.mean_cv_auc,
-                        mean_cv_f1=model.mean_cv_f1,
-                        cv_auc_scores=model.cv_auc_scores,
-                        cv_f1_scores=model.cv_f1_scores,
+                        mean_cv_auc=model.mean_cv_auc, mean_cv_f1=model.mean_cv_f1,
+                        mean_cv_accuracy=model.mean_cv_accuracy,
+                        mean_cv_precision=model.mean_cv_precision,
+                        mean_cv_recall=model.mean_cv_recall,
+                        cv_auc_scores=model.cv_auc_scores, cv_f1_scores=model.cv_f1_scores,
+                        cv_accuracy_scores=model.cv_accuracy_scores,
+                        cv_precision_scores=model.cv_precision_scores,
+                        cv_recall_scores=model.cv_recall_scores,
+                    )
+                elif selected_model_type == "random_forest":
+                    model = RandomForestSusceptibilityModel(
+                        n_estimators=100, cv_folds=5, random_state=config.random_seed,
+                    ).fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model, feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances, method="random_forest",
+                        validation_note=(
+                            f"Random Forest. 5-fold CV — "
+                            f"AUC: {model.mean_cv_auc:.3f}, F1: {model.mean_cv_f1:.3f}."
+                        ),
+                        mean_cv_auc=model.mean_cv_auc, mean_cv_f1=model.mean_cv_f1,
+                        cv_auc_scores=model.cv_auc_scores, cv_f1_scores=model.cv_f1_scores,
                     )
                 else:
                     model = WeightedSusceptibilityModel().fit(X)
                     analysis_result = AnalysisResult(
-                        model=model,
-                        feature_names=list(model.feature_names),
+                        model=model, feature_names=list(model.feature_names),
                         feature_importances=model.feature_importances,
                         method="weighted_susceptibility_index",
-                        validation_note=(
-                            "Relative susceptibility index; not calibrated against "
-                            "observed flood events."
-                        ),
+                        validation_note="Relative susceptibility index; not calibrated against observed flood events.",
                     )
 
                 st.write("🗺️ Scoring and rendering map…")
@@ -430,41 +444,50 @@ if run_button:
                 from flood_risk_zonation.scoring.susceptibility import (
                     WeightedSusceptibilityModel as _WSI,
                     RandomForestSusceptibilityModel as _RF,
+                    EnsembleSusceptibilityModel as _ENS,
                 )
-                if use_rf_model:
-                    model = _RF(
-                        n_estimators=100,
-                        cv_folds=5,
-                        random_state=config.random_seed,
+                if selected_model_type == "ensemble":
+                    model = _ENS(
+                        n_estimators=100, cv_folds=5, random_state=config.random_seed,
                     ).fit(X)
                     analysis_result = AnalysisResult(
-                        model=model,
-                        feature_names=list(model.feature_names),
-                        feature_importances=model.feature_importances,
-                        method="random_forest",
+                        model=model, feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances, method="ensemble",
                         validation_note=(
-                            f"Random Forest trained on WSI pseudo-labels. "
-                            f"5-fold CV — AUC: {model.mean_cv_auc:.3f}, "
-                            f"F1: {model.mean_cv_f1:.3f}. "
-                            "Labels derived from Weighted Susceptibility Index; not calibrated "
-                            "against observed flood events."
+                            f"Ensemble (WSI + RF). 5-fold CV — "
+                            f"AUC: {model.mean_cv_auc:.3f}, F1: {model.mean_cv_f1:.3f}, "
+                            f"Accuracy: {model.mean_cv_accuracy:.3f}."
                         ),
-                        mean_cv_auc=model.mean_cv_auc,
-                        mean_cv_f1=model.mean_cv_f1,
-                        cv_auc_scores=model.cv_auc_scores,
-                        cv_f1_scores=model.cv_f1_scores,
+                        mean_cv_auc=model.mean_cv_auc, mean_cv_f1=model.mean_cv_f1,
+                        mean_cv_accuracy=model.mean_cv_accuracy,
+                        mean_cv_precision=model.mean_cv_precision,
+                        mean_cv_recall=model.mean_cv_recall,
+                        cv_auc_scores=model.cv_auc_scores, cv_f1_scores=model.cv_f1_scores,
+                        cv_accuracy_scores=model.cv_accuracy_scores,
+                        cv_precision_scores=model.cv_precision_scores,
+                        cv_recall_scores=model.cv_recall_scores,
+                    )
+                elif selected_model_type == "random_forest":
+                    model = _RF(
+                        n_estimators=100, cv_folds=5, random_state=config.random_seed,
+                    ).fit(X)
+                    analysis_result = AnalysisResult(
+                        model=model, feature_names=list(model.feature_names),
+                        feature_importances=model.feature_importances, method="random_forest",
+                        validation_note=(
+                            f"Random Forest. 5-fold CV — "
+                            f"AUC: {model.mean_cv_auc:.3f}, F1: {model.mean_cv_f1:.3f}."
+                        ),
+                        mean_cv_auc=model.mean_cv_auc, mean_cv_f1=model.mean_cv_f1,
+                        cv_auc_scores=model.cv_auc_scores, cv_f1_scores=model.cv_f1_scores,
                     )
                 else:
                     model = _WSI().fit(X)
                     analysis_result = AnalysisResult(
-                        model=model,
-                        feature_names=list(model.feature_names),
+                        model=model, feature_names=list(model.feature_names),
                         feature_importances=model.feature_importances,
                         method="weighted_susceptibility_index",
-                        validation_note=(
-                            "Relative susceptibility index; not calibrated against "
-                            "observed flood events."
-                        ),
+                        validation_note="Relative susceptibility index; not calibrated against observed flood events.",
                     )
 
                 st.write("🗺️ Scoring and rendering map…")
@@ -636,18 +659,31 @@ with tab3:
         plt.close(fig)
         st.caption(result.analysis_result.validation_note)
 
-        # Show CV metrics if RF was used
+        # Show CV metrics if RF or Ensemble was used
         ar = result.analysis_result
-        if ar.method == "random_forest" and ar.mean_cv_auc is not None:
+        if ar.method in ("random_forest", "ensemble") and ar.mean_cv_auc is not None:
             st.markdown("**Cross-Validation Results (5-fold stratified)**")
-            col_m1, col_m2 = st.columns(2)
-            col_m1.metric("Mean AUC-ROC", f"{ar.mean_cv_auc:.3f}")
-            col_m2.metric("Mean F1 Score", f"{ar.mean_cv_f1:.3f}")
+            method_label = "Ensemble (WSI + RF)" if ar.method == "ensemble" else "Random Forest"
+            st.caption(f"Model: {method_label} · Labels: top-33% WSI scores = high risk")
+
+            # Metric cards
+            cols = st.columns(5)
+            cols[0].metric("AUC-ROC", f"{ar.mean_cv_auc:.3f}")
+            cols[1].metric("F1 Score", f"{ar.mean_cv_f1:.3f}")
+            cols[2].metric("Accuracy", f"{ar.mean_cv_accuracy:.3f}" if ar.mean_cv_accuracy else "—")
+            cols[3].metric("Precision", f"{ar.mean_cv_precision:.3f}" if ar.mean_cv_precision else "—")
+            cols[4].metric("Recall", f"{ar.mean_cv_recall:.3f}" if ar.mean_cv_recall else "—")
+
+            # Per-fold table
             if ar.cv_auc_scores:
+                n_folds = len(ar.cv_auc_scores)
                 fold_df = pd.DataFrame({
-                    "Fold": [f"Fold {i+1}" for i in range(len(ar.cv_auc_scores))],
-                    "AUC": [f"{v:.3f}" for v in ar.cv_auc_scores],
-                    "F1":  [f"{v:.3f}" for v in (ar.cv_f1_scores or [])],
+                    "Fold": [f"Fold {i+1}" for i in range(n_folds)],
+                    "AUC-ROC":   [f"{v:.3f}" for v in ar.cv_auc_scores],
+                    "F1":        [f"{v:.3f}" for v in (ar.cv_f1_scores or [])],
+                    "Accuracy":  [f"{v:.3f}" for v in (ar.cv_accuracy_scores or ["—"]*n_folds)],
+                    "Precision": [f"{v:.3f}" for v in (ar.cv_precision_scores or ["—"]*n_folds)],
+                    "Recall":    [f"{v:.3f}" for v in (ar.cv_recall_scores or ["—"]*n_folds)],
                 })
                 st.dataframe(fold_df, use_container_width=True, hide_index=True)
     else:

@@ -206,9 +206,14 @@ class RandomForestSusceptibilityModel:
 
         X_feat = X[self.feature_names]
 
-        # Step 2: stratified k-fold CV
+        # Step 2: stratified k-fold CV — guard for tiny datasets
+        n_pos_total = int(labels.sum())
+        n_neg_total = len(labels) - n_pos_total
+        max_folds = min(self.cv_folds, n_pos_total, n_neg_total)
+        actual_folds = max(2, max_folds) if max_folds >= 2 else 2
+
         skf = StratifiedKFold(
-            n_splits=self.cv_folds, shuffle=True, random_state=self.random_state
+            n_splits=actual_folds, shuffle=True, random_state=self.random_state
         )
         auc_scores: list[float] = []
         f1_scores: list[float] = []
@@ -262,6 +267,211 @@ class RandomForestSusceptibilityModel:
     @property
     def feature_importances(self) -> dict[str, float]:
         """Return feature importances sorted by importance descending."""
+        return dict(
+            sorted(
+                zip(self.feature_names, self.feature_importances_.tolist()),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+        )
+
+
+class EnsembleSusceptibilityModel:
+    """
+    Ensemble model combining WeightedSusceptibilityModel (WSI) and
+    RandomForestSusceptibilityModel (RF) by averaging their probability outputs.
+
+    Workflow
+    --------
+    1. Fit WSI on X — produces continuous susceptibility scores.
+    2. Use WSI scores to generate pseudo-labels (top high_percentile% = high risk).
+    3. Fit RF on (X, pseudo-labels) with stratified k-fold CV.
+    4. At inference: average WSI and RF probabilities (50/50 blend).
+    5. Report full CV metrics: Accuracy, Precision, Recall, F1, AUC-ROC.
+
+    Exposes the same predict_proba / feature_importances interface as both
+    component models — drop-in replacement in the pipeline.
+
+    Parameters
+    ----------
+    n_estimators : int
+        Number of trees in the Random Forest component.
+    cv_folds : int
+        Stratified CV folds for RF training.
+    high_percentile : float
+        Top-N% of WSI scores treated as high-risk pseudo-labels.
+    wsi_weight : float
+        Blend weight for WSI probabilities (default 0.5 = equal blend).
+    random_state : int
+        Reproducibility seed.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 200,
+        min_samples_leaf: int = 5,
+        cv_folds: int = 5,
+        high_percentile: float = 33.0,
+        wsi_weight: float = 0.5,
+        random_state: int = 42,
+    ) -> None:
+        self.n_estimators = n_estimators
+        self.min_samples_leaf = min_samples_leaf
+        self.cv_folds = cv_folds
+        self.high_percentile = high_percentile
+        self.wsi_weight = float(wsi_weight)
+        self.rf_weight = 1.0 - self.wsi_weight
+        self.random_state = random_state
+
+        self._wsi: WeightedSusceptibilityModel | None = None
+        self._rf = None
+        self.feature_names: list[str] = []
+        self.feature_importances_: np.ndarray = np.array([])
+
+        # Full CV metrics (populated after fit)
+        self.mean_cv_accuracy: float = 0.0
+        self.mean_cv_precision: float = 0.0
+        self.mean_cv_recall: float = 0.0
+        self.mean_cv_f1: float = 0.0
+        self.mean_cv_auc: float = 0.0
+
+        self.cv_accuracy_scores: list[float] = []
+        self.cv_precision_scores: list[float] = []
+        self.cv_recall_scores: list[float] = []
+        self.cv_f1_scores: list[float] = []
+        self.cv_auc_scores: list[float] = []
+
+    def _build_rf(self):
+        from sklearn.ensemble import RandomForestClassifier
+        return RandomForestClassifier(
+            n_estimators=self.n_estimators,
+            min_samples_leaf=self.min_samples_leaf,
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+
+    def fit(self, X: pd.DataFrame) -> "EnsembleSusceptibilityModel":
+        """
+        Fit both WSI and RF components; compute full CV metrics on the ensemble.
+        """
+        from sklearn.metrics import (
+            accuracy_score, precision_score, recall_score,
+            f1_score, roc_auc_score,
+        )
+        from sklearn.model_selection import StratifiedKFold
+
+        self.feature_names = [c for c in FACTOR_WEIGHTS if c in X.columns]
+
+        # ── Step 1: Fit WSI ───────────────────────────────────────────────────
+        self._wsi = WeightedSusceptibilityModel().fit(X)
+        wsi_scores = self._wsi._positive_probability(X)
+
+        # ── Step 2: Generate pseudo-labels ───────────────────────────────────
+        threshold = float(np.percentile(wsi_scores, 100.0 - self.high_percentile))
+        labels = (wsi_scores >= threshold).astype(int)
+
+        n_pos = int(labels.sum())
+        logger.info(
+            "Ensemble pseudo-labels: %d high-risk (%.1f%%), %d low-risk.",
+            n_pos, 100.0 * n_pos / len(labels), len(labels) - n_pos,
+        )
+
+        X_feat = X[self.feature_names]
+
+        # ── Step 3: Stratified CV — evaluate the ENSEMBLE (WSI + RF blend) ───
+        # Guard: reduce folds if dataset is too small for requested CV splits
+        n_samples = len(X_feat)
+        n_pos_total = int(labels.sum())
+        n_neg_total = n_samples - n_pos_total
+        max_folds = min(self.cv_folds, n_pos_total, n_neg_total)
+        actual_folds = max(2, max_folds) if max_folds >= 2 else 2
+
+        skf = StratifiedKFold(
+            n_splits=actual_folds, shuffle=True, random_state=self.random_state
+        )
+        acc_scores, prec_scores, rec_scores, f1_scores, auc_scores = [], [], [], [], []
+
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_feat, labels)):
+            X_tr, X_val = X_feat.iloc[train_idx], X_feat.iloc[val_idx]
+            y_tr, y_val = labels[train_idx], labels[val_idx]
+
+            # Train fold RF
+            fold_rf = self._build_rf()
+            fold_rf.fit(X_tr, y_tr)
+
+            # WSI probabilities for validation set
+            wsi_val_prob = self._wsi._positive_probability(X_val)
+            # RF probabilities for validation set (guard: single-class fold → col 0)
+            rf_proba = fold_rf.predict_proba(X_val)
+            rf_val_prob = rf_proba[:, 1] if rf_proba.shape[1] > 1 else rf_proba[:, 0]
+            # Blended ensemble probability
+            ensemble_prob = self.wsi_weight * wsi_val_prob + self.rf_weight * rf_val_prob
+            ensemble_pred = (ensemble_prob >= 0.5).astype(int)
+
+            acc_scores.append(float(accuracy_score(y_val, ensemble_pred)))
+            prec_scores.append(float(precision_score(y_val, ensemble_pred, zero_division=0)))
+            rec_scores.append(float(recall_score(y_val, ensemble_pred, zero_division=0)))
+            f1_scores.append(float(f1_score(y_val, ensemble_pred, zero_division=0)))
+            try:
+                auc_scores.append(float(roc_auc_score(y_val, ensemble_prob)))
+            except ValueError:
+                auc_scores.append(0.5)
+
+            logger.debug(
+                "Ensemble CV fold %d: Acc=%.4f Prec=%.4f Rec=%.4f F1=%.4f AUC=%.4f",
+                fold + 1, acc_scores[-1], prec_scores[-1],
+                rec_scores[-1], f1_scores[-1], auc_scores[-1],
+            )
+
+        self.cv_accuracy_scores = acc_scores
+        self.cv_precision_scores = prec_scores
+        self.cv_recall_scores = rec_scores
+        self.cv_f1_scores = f1_scores
+        self.cv_auc_scores = auc_scores
+
+        self.mean_cv_accuracy = float(np.mean(acc_scores))
+        self.mean_cv_precision = float(np.mean(prec_scores))
+        self.mean_cv_recall = float(np.mean(rec_scores))
+        self.mean_cv_f1 = float(np.mean(f1_scores))
+        self.mean_cv_auc = float(np.mean(auc_scores))
+
+        logger.info(
+            "Ensemble CV — Acc=%.4f Prec=%.4f Rec=%.4f F1=%.4f AUC=%.4f",
+            self.mean_cv_accuracy, self.mean_cv_precision,
+            self.mean_cv_recall, self.mean_cv_f1, self.mean_cv_auc,
+        )
+
+        # ── Step 4: Train final RF on ALL data ───────────────────────────────
+        self._rf = self._build_rf()
+        self._rf.fit(X_feat, labels)
+
+        # Blend RF importances with WSI declared weights (average)
+        rf_imp = self._rf.feature_importances_
+        wsi_imp = np.array(
+            [self._wsi.factor_weights[n][0] for n in self.feature_names],
+            dtype=np.float64,
+        )
+        wsi_imp /= wsi_imp.sum()
+        blended = self.wsi_weight * wsi_imp + self.rf_weight * rf_imp
+        blended /= blended.sum()
+        self.feature_importances_ = blended
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Return blended WSI + RF probability array (sklearn-compatible 2-column).
+        """
+        if self._rf is None or self._wsi is None:
+            raise ValueError("EnsembleSusceptibilityModel must be fitted before scoring.")
+        X_feat = X[self.feature_names]
+        wsi_prob = self._wsi._positive_probability(X_feat)
+        rf_prob = self._rf.predict_proba(X_feat)[:, 1]
+        blended = self.wsi_weight * wsi_prob + self.rf_weight * rf_prob
+        return np.column_stack((1.0 - blended, blended))
+
+    @property
+    def feature_importances(self) -> dict[str, float]:
+        """Blended feature importances (WSI weights + RF importances averaged)."""
         return dict(
             sorted(
                 zip(self.feature_names, self.feature_importances_.tolist()),

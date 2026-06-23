@@ -152,5 +152,5 @@ def test_pipeline_config_valid_defaults():
     """Default PipelineConfig() must construct without raising any error."""
     config = PipelineConfig()
     assert config.cell_size_meters == 500.0
-    assert config.model_type == "weighted_susceptibility"
+    assert config.model_type == "ensemble"
     assert config.low_threshold < config.medium_threshold
