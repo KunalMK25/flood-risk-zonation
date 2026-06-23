@@ -267,20 +267,151 @@ def build_cell_explanation(
     if risk_class == "Water":
         wtype_raw = str(row.get("water_type", "")).lower()
         wtype_label = _WATER_TYPE_LABELS.get(wtype_raw, "permanent water body")
+        mask_reason = str(row.get("water_mask_reason", "")).lower()
+
+        # Determine classification trigger
+        coverage_pct = row.get("water_coverage_pct", None)
+        coverage_str = f"{float(coverage_pct):.0f}%" if coverage_pct is not None and float(coverage_pct) > 0 else None
+
+        if mask_reason == "coverage":
+            trigger_icon = "🌊"
+            trigger_label = "Water area coverage"
+            trigger_detail = (
+                f"{coverage_str + ' of this cell is covered by water geometry' if coverage_str else 'Over 60% of this cell is water'} "
+                f"(threshold: ≥ 60%)"
+            )
+            body_type = wtype_label if wtype_raw else "permanent water body"
+        elif mask_reason == "elevation":
+            elev_val = row.get("elevation_m", None)
+            elev_str = f"{float(elev_val):.1f} m" if elev_val is not None else "≤ 3 m"
+            trigger_icon = "📏"
+            trigger_label = "Elevation threshold"
+            trigger_detail = f"Cell elevation ({elev_str}) ≤ 3 m — SRTM identifies this as sea/ocean surface"
+            body_type = "ocean / sea"
+        elif mask_reason == "osm_polygon":
+            trigger_icon = "🗺️"
+            trigger_label = "OSM polygon boundary"
+            trigger_detail = f"Cell centroid lies inside an OSM {wtype_label} area polygon"
+            body_type = wtype_label
+        else:
+            trigger_icon = "💧"
+            trigger_label = "Permanent water body"
+            trigger_detail = "Identified as permanent water — flood risk scoring does not apply"
+            body_type = wtype_label if wtype_label else "permanent water body"
+
+        # Pull actual feature values to show in popup
+        elev_val = row.get("elevation_m", None)
+        dist_val = row.get("dist_water_m", None)
+        rain_val = row.get("rainfall_mean_mm", None)
+
         tooltip_html = (
             f'<div style="font-family:Arial,sans-serif;font-size:12px;'
             f'padding:3px 6px;background:{risk_color};color:white;border-radius:3px">'
-            f'<b>💧 Water</b></div>'
+            f'<b>💧 Water — {body_type}</b></div>'
         )
+
+        # Build popup
+        lines_w: list[str] = []
+
+        # Header
+        lines_w.append(
+            f'<div style="background:{risk_color};color:white;padding:6px 8px;'
+            f'border-radius:4px;margin-bottom:6px;font-size:13px">'
+            f'<b>💧 Water Body</b>'
+            f'<span style="font-size:10px;opacity:0.85;float:right">{body_type}</span>'
+            f'</div>'
+        )
+
+        # Classification reason box
+        lines_w.append(
+            f'<div style="background:#ebf5fb;border-left:3px solid {risk_color};'
+            f'padding:5px 8px;border-radius:0 4px 4px 0;margin-bottom:7px;font-size:11px">'
+            f'<b>{trigger_icon} Classification trigger: {trigger_label}</b><br>'
+            f'<span style="color:#555">{trigger_detail}</span>'
+            f'</div>'
+        )
+
+        # Classification criteria table
+        lines_w.append(
+            '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:5px">'
+            '<tr style="background:#f4f4f4">'
+            '<th style="text-align:left;padding:4px 5px;font-weight:600">Parameter</th>'
+            '<th style="text-align:left;padding:4px 5px;font-weight:600">Value</th>'
+            '<th style="text-align:left;padding:4px 5px;font-weight:600">Threshold</th>'
+            '</tr>'
+        )
+
+        # Elevation row
+        elev_display = f"{float(elev_val):.1f} m" if elev_val is not None else "—"
+        elev_thresh = "≤ 3 m (sea)" if mask_reason == "elevation" else "N/A"
+        elev_highlight = "background:#ebf5fb" if mask_reason == "elevation" else ""
+        lines_w.append(
+            f'<tr style="border-bottom:1px solid #f0f0f0;{elev_highlight}">'
+            f'<td style="padding:4px 5px">⛰ Elevation</td>'
+            f'<td style="padding:4px 5px;font-weight:bold">{elev_display}</td>'
+            f'<td style="padding:4px 5px;color:#888">{elev_thresh}</td>'
+            f'</tr>'
+        )
+
+        # Water coverage row — shown when coverage mask triggered
+        if mask_reason == "coverage" and coverage_str:
+            lines_w.append(
+                f'<tr style="border-bottom:1px solid #f0f0f0;background:#ebf5fb">'
+                f'<td style="padding:4px 5px">💧 Water coverage</td>'
+                f'<td style="padding:4px 5px;font-weight:bold">{coverage_str}</td>'
+                f'<td style="padding:4px 5px;color:#888">≥ 60% → Water</td>'
+                f'</tr>'
+            )
+
+        # Water type row
+        wtype_display = wtype_label if wtype_raw else "detected via OSM / elevation"
+        osm_highlight = "background:#ebf5fb" if mask_reason in ("osm_polygon", "ocean_buffer") else ""
+        lines_w.append(
+            f'<tr style="border-bottom:1px solid #f0f0f0;{osm_highlight}">'
+            f'<td style="padding:4px 5px">🗺️ Water type</td>'
+            f'<td style="padding:4px 5px;font-weight:bold">{wtype_display}</td>'
+            f'<td style="padding:4px 5px;color:#888">OSM polygon / coastline</td>'
+            f'</tr>'
+        )
+
+        # Distance to water row
+        if dist_val is not None:
+            dist_display = f"{float(dist_val):.0f} m"
+            lines_w.append(
+                f'<tr style="border-bottom:1px solid #f0f0f0">'
+                f'<td style="padding:4px 5px">🏞 Dist. to water</td>'
+                f'<td style="padding:4px 5px">{dist_display}</td>'
+                f'<td style="padding:4px 5px;color:#888">Reference only</td>'
+                f'</tr>'
+            )
+
+        # Rainfall row
+        if rain_val is not None:
+            rain_display = f"{float(rain_val):.0f} mm/yr"
+            lines_w.append(
+                f'<tr style="border-bottom:1px solid #f0f0f0">'
+                f'<td style="padding:4px 5px">🌧 Annual rainfall</td>'
+                f'<td style="padding:4px 5px">{rain_display}</td>'
+                f'<td style="padding:4px 5px;color:#888">Reference only</td>'
+                f'</tr>'
+            )
+
+        lines_w.append('</table>')
+
+        # Footer note
+        lines_w.append(
+            '<div style="font-size:10px;color:#777;padding:3px 5px;'
+            'background:#f8f9fa;border-radius:3px">'
+            'ℹ️ Water cells are excluded from flood risk scoring. '
+            'Adjacent land cells may have elevated risk from overflow.'
+            '</div>'
+        )
+
         popup_html = (
             f'<div style="font-family:Arial,sans-serif;font-size:12px;'
-            f'min-width:190px;max-width:240px">'
-            f'<div style="background:{risk_color};color:white;padding:5px 8px;'
-            f'border-radius:4px;margin-bottom:6px"><b>💧 Water Body</b></div>'
-            f'<div style="color:#555;font-size:11px;line-height:1.5">'
-            f'This cell is a <b>{wtype_label}</b>.<br>'
-            f'Masked as permanent water — flood risk scoring does not apply.'
-            f'</div></div>'
+            f'min-width:260px;max-width:320px">'
+            + "".join(lines_w)
+            + '</div>'
         )
         return tooltip_html, popup_html
 

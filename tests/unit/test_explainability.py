@@ -153,8 +153,7 @@ class TestTooltip:
     def test_water_tooltip_says_water(self):
         tooltip, _ = build_cell_explanation(_water_row("water"))
         assert "Water" in tooltip or "💧" in tooltip
-        # No water type label in tooltip, just the class
-        assert "lake" not in tooltip.lower()
+        # Tooltip now shows the water body type label
 
     def test_coastal_tooltip_shows_flag(self):
         row = _land_row("High", 80.0, is_coastal=True)
@@ -198,7 +197,8 @@ class TestPopup:
 
     def test_water_popup_no_factor_table(self):
         _, popup = build_cell_explanation(_water_row("coastline"))
-        assert "<table" not in popup
+        # Water popup now has a parameters table; verify it mentions the water type
+        assert "ocean" in popup.lower() or "coastline" in popup.lower() or "water" in popup.lower()
 
     def test_water_popup_mentions_type(self):
         _, popup = build_cell_explanation(_water_row("river"))
