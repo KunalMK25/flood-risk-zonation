@@ -277,12 +277,12 @@ class FloodRiskPipeline:
         apply_elevation_mask = elevation_source not in synthetic_sources
 
         if apply_elevation_mask and "elevation_m" in result.columns:
-            sea_mask = result["elevation_m"].values <= 1.0
+            sea_mask = result["elevation_m"].values <= 3.0
             n_sea = int(sea_mask.sum())
             if n_sea > 0:
                 result.loc[sea_mask, "risk_class"] = "Water"
                 result.loc[sea_mask, "risk_score"] = 0.0
-                logger.info("Elevation mask: %d sea/ocean cells (elev ≤ 1 m) → Water.", n_sea)
+                logger.info("Elevation mask: %d sea/ocean cells (elev ≤ 3 m) → Water.", n_sea)
         elif not apply_elevation_mask:
             logger.debug("Elevation mask skipped (source: %s).", elevation_source)
 
@@ -303,6 +303,7 @@ class FloodRiskPipeline:
             area_geoms: list = []   # for Water-mask step 2
             ocean_geoms: list = []  # for coastal tsunami flag step 4
             all_valid_geoms: list = []  # for proximity boost step 3 (all types)
+            coastline_line_geoms: list = []  # raw coastline LineStrings
 
             for _, wb_row in wb_m.iterrows():
                 geom = wb_row.geometry
@@ -317,6 +318,9 @@ class FloodRiskPipeline:
                     area_geoms.append(geom)
                 if wtype in OCEAN_TYPES:
                     ocean_geoms.append(geom)
+                    # Collect raw LineStrings for the ocean flood-fill below
+                    if geom.geom_type in {"LineString", "MultiLineString"}:
+                        coastline_line_geoms.append(geom)
 
             if not all_valid_geoms:
                 return result
@@ -333,10 +337,35 @@ class FloodRiskPipeline:
                 g for g in area_geoms
                 if g.geom_type in {"Polygon", "MultiPolygon"}
             ]
+
+            # ── Ocean flood-fill: convert coastline LineStrings → buffered ocean zone ─
+            # OSM natural=coastline is a LineString (land/sea boundary), not a polygon.
+            # We create a wide buffer around it and use elevation to identify which
+            # buffered cells are actually over the sea (elevation ≤ 5 m).
+            # Buffer = 3 × cell_size to cover ocean cells that touch the coast.
+            ocean_buffer_polygon = None
+            if coastline_line_geoms:
+                try:
+                    coastline_union = unary_union(coastline_line_geoms)
+                    ocean_buffer_polygon = coastline_union.buffer(
+                        config.cell_size_meters * 3.0
+                    )
+                    # Add to area_polygon_geoms so the centroid test covers ocean cells
+                    area_polygon_geoms.append(ocean_buffer_polygon)
+                    logger.info(
+                        "Ocean buffer zone created from %d coastline LineString(s).",
+                        len(coastline_line_geoms),
+                    )
+                except Exception as buf_exc:
+                    logger.debug("Coastline buffer failed: %s", buf_exc)
+
             area_polygon_union = unary_union(area_polygon_geoms) if area_polygon_geoms else None
 
-            # Ocean union for the coastal tsunami flag
-            ocean_union = unary_union(ocean_geoms) if ocean_geoms else None
+            # Ocean union for the coastal tsunami flag (include buffered zone too)
+            ocean_union_geoms = ocean_geoms[:]
+            if ocean_buffer_polygon is not None:
+                ocean_union_geoms.append(ocean_buffer_polygon)
+            ocean_union = unary_union(ocean_union_geoms) if ocean_union_geoms else None
 
             # Build centroid GeoSeries in EPSG:3857
             centroid_pts_m = gpd.GeoSeries(
@@ -350,15 +379,23 @@ class FloodRiskPipeline:
             # Step 2: centroid lies inside an area water polygon
             # Using centroid point (not full cell polygon) prevents thin
             # drain/stream sliver polygons from falsely masking adjacent cells.
+            # For the ocean buffer zone, also require elevation ≤ 5 m to
+            # avoid falsely masking low-lying coastal land cells.
             osm_water = np.zeros(len(result), dtype=bool)
+            has_elevation = "elevation_m" in result.columns
             if area_polygon_union is not None:
                 for i, pt in enumerate(centroid_pts_m):
-                    if not already_water[i]:
-                        try:
-                            if area_polygon_union.contains(pt):
-                                osm_water[i] = True
-                        except Exception:
-                            pass
+                    if already_water[i]:
+                        continue
+                    try:
+                        if area_polygon_union.contains(pt):
+                            # For ocean buffer zone: require low elevation
+                            if ocean_buffer_polygon is not None and ocean_buffer_polygon.contains(pt):
+                                if has_elevation and float(result.iloc[i]["elevation_m"]) > 5.0:
+                                    continue  # land cell inside buffer but elevated — skip
+                            osm_water[i] = True
+                    except Exception:
+                        pass
 
             # Step 3: centroid within proximity of ANY water geometry (incl. linear)
             proximity = np.zeros(len(result), dtype=bool)
