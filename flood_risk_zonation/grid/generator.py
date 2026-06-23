@@ -7,19 +7,20 @@ cells, each approximately cell_size_meters × cell_size_meters.
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import Polygon
 
 from flood_risk_zonation.config import BoundingBox
+from flood_risk_zonation.exceptions import ConfigurationError
 
 
 def generate_grid(
     bounding_box: BoundingBox,
     cell_size_meters: float = 500.0,
     crs: str = "EPSG:4326",
+    max_cells: int = 100_000,
 ) -> gpd.GeoDataFrame:
     """
     Partition the bounding box into a regular grid of square cells.
@@ -48,7 +49,17 @@ def generate_grid(
     cell_deg_lat = cell_size_meters / 111_320.0
     cell_deg_lon = cell_size_meters / (111_320.0 * math.cos(lat_rad))
 
-    # Generate grid coordinates
+    n_lon = math.ceil((bounding_box.max_lon - bounding_box.min_lon) / cell_deg_lon)
+    n_lat = math.ceil((bounding_box.max_lat - bounding_box.min_lat) / cell_deg_lat)
+    estimated_cells = n_lon * n_lat
+    if estimated_cells > max_cells:
+        raise ConfigurationError(
+            f"Requested grid would contain approximately {estimated_cells:,} cells, "
+            f"exceeding the configured limit of {max_cells:,}. Reduce the area or "
+            "choose a larger cell size."
+        )
+
+    # Generate grid coordinates only after the allocation guard.
     lons = np.arange(bounding_box.min_lon, bounding_box.max_lon, cell_deg_lon)
     lats = np.arange(bounding_box.min_lat, bounding_box.max_lat, cell_deg_lat)
 

@@ -7,7 +7,7 @@ containers passed between pipeline stages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -87,6 +87,17 @@ class DrainageDataset:
 
 
 @dataclass
+class AnalysisResult:
+    """Metadata and artefacts produced by a susceptibility analysis."""
+
+    model: Any
+    feature_names: list[str]
+    feature_importances: dict[str, float]
+    method: str
+    validation_note: str
+
+
+@dataclass
 class TrainingResult:
     """
     Artefacts produced by a completed model training run.
@@ -141,11 +152,18 @@ class FloodRiskResult:
     """
 
     scored_grid: Any  # gpd.GeoDataFrame
-    training_result: TrainingResult
+    analysis_result: AnalysisResult
     bounding_box: Any  # BoundingBox — avoid circular import at module level
     config: Any        # PipelineConfig
     pipeline_duration_seconds: float
     cell_count: int
+    data_provenance: dict[str, str] = field(default_factory=dict)
+    data_tier: int = 3
+
+    @property
+    def training_result(self) -> AnalysisResult:
+        """Backward-compatible alias for callers using the pre-0.2 API."""
+        return self.analysis_result
 
     @property
     def risk_distribution(self) -> dict[str, int]:

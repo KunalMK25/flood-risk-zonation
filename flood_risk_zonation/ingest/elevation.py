@@ -46,46 +46,67 @@ def load_elevation(bounding_box: BoundingBox, data_dir: Path | str) -> RasterDat
     DataIngestionError
         If no GeoTIFF file is found or the bbox is outside coverage.
     """
-    data_dir = Path(data_dir)
-    tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
+    data_path = Path(data_dir)
+    if data_path.is_file():
+        tif_files = [data_path]
+    else:
+        tif_files = sorted(data_path.glob("*.tif")) + sorted(data_path.glob("*.tiff"))
 
     if not tif_files:
         raise DataIngestionError(
-            f"No SRTM GeoTIFF files found in {data_dir}. "
+            f"No SRTM GeoTIFF files found in {data_path}. "
             "Use generate_synthetic_elevation() for demo/test mode."
         )
 
-    tif_path = tif_files[0]
-    try:
-        with rasterio.open(tif_path) as src:
-            # Check coverage
-            bounds = src.bounds
-            if (bounding_box.max_lon < bounds.left or bounding_box.min_lon > bounds.right
-                    or bounding_box.max_lat < bounds.bottom or bounding_box.min_lat > bounds.top):
-                raise DataIngestionError(
-                    f"Bounding box {bounding_box} falls outside SRTM coverage {bounds}."
+    errors: list[str] = []
+    for tif_path in tif_files:
+        try:
+            with rasterio.open(tif_path) as src:
+                if src.crs is None:
+                    errors.append(f"{tif_path.name}: missing CRS")
+                    continue
+                target_bounds = rasterio.warp.transform_bounds(
+                    "EPSG:4326",
+                    src.crs,
+                    bounding_box.min_lon,
+                    bounding_box.min_lat,
+                    bounding_box.max_lon,
+                    bounding_box.max_lat,
                 )
+                left, bottom, right, top = target_bounds
+                bounds = src.bounds
+                if right <= bounds.left or left >= bounds.right or top <= bounds.bottom or bottom >= bounds.top:
+                    continue
 
-            from rasterio.windows import from_bounds as window_from_bounds
-            window = window_from_bounds(
-                bounding_box.min_lon, bounding_box.min_lat,
-                bounding_box.max_lon, bounding_box.max_lat,
-                src.transform,
-            )
-            array = src.read(1, window=window).astype(np.float32)
-            transform = src.window_transform(window)
-            crs = src.crs
-            nodata = src.nodata
+                # Clip partially overlapping requests to the source raster.
+                left = max(left, bounds.left)
+                bottom = max(bottom, bounds.bottom)
+                right = min(right, bounds.right)
+                top = min(top, bounds.top)
+                from rasterio.windows import from_bounds as window_from_bounds
+                window = window_from_bounds(left, bottom, right, top, src.transform)
+                window = window.round_offsets().round_lengths()
+                array = src.read(1, window=window).astype(np.float32)
+                if array.size == 0:
+                    continue
+                transform = src.window_transform(window)
+                nodata = src.nodata
+                if nodata is not None:
+                    array[array == nodata] = np.nan
 
-    except rasterio.errors.RasterioIOError as exc:
-        raise DataIngestionError(f"Failed to read {tif_path}: {exc}") from exc
+                return RasterDataset(
+                    array=array,
+                    transform=transform,
+                    crs=src.crs,
+                    nodata=nodata,
+                    source=str(tif_path),
+                )
+        except (rasterio.errors.RasterioIOError, ValueError) as exc:
+            errors.append(f"{tif_path.name}: {exc}")
 
-    return RasterDataset(
-        array=array,
-        transform=transform,
-        crs=crs,
-        nodata=nodata,
-        source=str(tif_path),
+    detail = f" ({'; '.join(errors)})" if errors else ""
+    raise DataIngestionError(
+        f"No elevation GeoTIFF in {data_path} covers {bounding_box}.{detail}"
     )
 
 

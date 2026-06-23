@@ -59,8 +59,14 @@ def _sample_raster_mean(raster: RasterDataset, grid: gpd.GeoDataFrame) -> np.nda
     """Sample mean raster value per grid cell centroid (nearest-neighbour)."""
     from rasterio.transform import rowcol
     nrows, ncols = raster.array.shape
-    lons = grid["centroid_lon"].values
-    lats = grid["centroid_lat"].values
+    lons = grid["centroid_lon"].values.astype(np.float64)
+    lats = grid["centroid_lat"].values.astype(np.float64)
+    if raster.crs is not None:
+        from pyproj import CRS, Transformer
+        raster_crs = CRS.from_user_input(raster.crs)
+        if raster_crs != CRS.from_epsg(4326):
+            transformer = Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
+            lons, lats = transformer.transform(lons, lats)
     values = np.full(len(grid), np.nan, dtype=np.float64)
     for i, (lon, lat) in enumerate(zip(lons, lats)):
         row, col = rowcol(raster.transform, lon, lat)
@@ -86,9 +92,8 @@ def extract_features(
     3. Compute hydrological features (distance to water, drainage density)
     4. Extract rainfall features (mean annual, max 24h)
     5. Sample population density per cell centroid
-    6. Apply log-scaling to population_density and dist_water_m
-    7. Impute any remaining NaN values
-    8. Clamp features to physically valid ranges
+    6. Impute any remaining NaN values
+    7. Clamp features to physically valid ranges
 
     Parameters
     ----------
@@ -117,8 +122,16 @@ def extract_features(
     result["elevation_m"] = elevation.astype(np.float32)
 
     # --- Terrain features from DEM array ---
-    dem = elevation_raster.array
-    cell_size_m = abs(elevation_raster.transform.a) * 111_320.0  # approx metres per pixel
+    dem = impute_missing_values(elevation_raster.array)
+    from pyproj import CRS
+    elevation_crs = CRS.from_user_input(elevation_raster.crs)
+    if elevation_crs.is_geographic:
+        center_lat = float(grid["centroid_lat"].mean())
+        x_size_m = abs(elevation_raster.transform.a) * 111_320.0 * np.cos(np.radians(center_lat))
+        y_size_m = abs(elevation_raster.transform.e) * 111_320.0
+        cell_size_m = max(1e-6, float(np.sqrt(x_size_m * y_size_m)))
+    else:
+        cell_size_m = max(1e-6, abs(float(elevation_raster.transform.a)))
 
     slope = compute_slope(dem, cell_size_m)
     twi = compute_twi(dem, cell_size_m)
@@ -129,8 +142,12 @@ def extract_features(
     def _map_dem_to_grid(dem_feature: np.ndarray) -> np.ndarray:
         """Sample a DEM-derived feature array at each grid cell centroid."""
         nrows, ncols = dem_feature.shape
-        lons = grid["centroid_lon"].values
-        lats = grid["centroid_lat"].values
+        lons = grid["centroid_lon"].values.astype(np.float64)
+        lats = grid["centroid_lat"].values.astype(np.float64)
+        if elevation_crs != CRS.from_epsg(4326):
+            from pyproj import Transformer
+            transformer = Transformer.from_crs("EPSG:4326", elevation_crs, always_xy=True)
+            lons, lats = transformer.transform(lons, lats)
         values = np.full(len(grid), np.nan, dtype=np.float64)
         from rasterio.transform import rowcol
         for i, (lon, lat) in enumerate(zip(lons, lats)):
@@ -157,11 +174,6 @@ def extract_features(
     # --- Population density ---
     pop = _sample_raster_mean(population_raster, grid)
     result["population_density"] = pop.astype(np.float32)
-
-    # --- Log-scaling ---
-    # log1p(x) = ln(1 + x) keeps 0 → 0 and avoids log(0)
-    result["population_density"] = np.log1p(result["population_density"].values).astype(np.float32)
-    result["dist_water_m"] = np.log1p(result["dist_water_m"].values).astype(np.float32)
 
     # --- Final imputation pass ---
     for col in FEATURE_COLUMNS:

@@ -19,7 +19,11 @@ RISK_COLOR_MAP = {
 
 
 def add_risk_choropleth_layer(folium_map: folium.Map, scored_grid: gpd.GeoDataFrame) -> folium.Map:
-    """Render risk zones using bulk GeoJson per class — fast for any grid size."""
+    """Render risk zones using bulk GeoJson per class — fast for any grid size.
+
+    Rendered as non-interactive (no tooltip/popup) so that mouse events
+    pass through to the per-cell explainability layer added on top.
+    """
     fg = folium.FeatureGroup(name="Risk Classification", show=True)
     for risk_class, color in RISK_COLOR_MAP.items():
         subset = scored_grid[scored_grid["risk_class"] == risk_class]
@@ -28,7 +32,10 @@ def add_risk_choropleth_layer(folium_map: folium.Map, scored_grid: gpd.GeoDataFr
         folium.GeoJson(
             subset.__geo_interface__,
             style_function=lambda _, c=color: {
-                "fillColor": c, "color": c, "weight": 0.3, "fillOpacity": 0.6,
+                "fillColor": c,
+                "color": c,
+                "weight": 0.3,
+                "fillOpacity": 0.6,
             },
         ).add_to(fg)
     fg.add_to(folium_map)

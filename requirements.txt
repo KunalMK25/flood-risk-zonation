@@ -17,3 +17,4 @@ scipy>=1.11
 shapely>=2.0
 reportlab>=4.0
 requests>=2.31
+tenacity>=8.2

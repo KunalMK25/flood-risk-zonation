@@ -37,7 +37,7 @@ def test_map_contains_layer_control():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = pathlib.Path(tmpdir) / "map.html"
         m.save(str(path))
-        html = path.read_text()
+        html = path.read_text(encoding="utf-8")
     # Folium 0.20 uses "layer_control_" prefix in the saved HTML
     assert "layer_control" in html or "LayerControl" in html or "L.control.layers" in html
 

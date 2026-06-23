@@ -13,7 +13,6 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 
 from flood_risk_zonation.config import BoundingBox, PipelineConfig
 from flood_risk_zonation.exceptions import FloodRiskError
@@ -24,9 +23,9 @@ from flood_risk_zonation.ingest.elevation import generate_synthetic_elevation
 from flood_risk_zonation.ingest.population import load_population
 from flood_risk_zonation.ingest.rainfall import generate_synthetic_rainfall
 from flood_risk_zonation.ingest.water_bodies import load_water_bodies
-from flood_risk_zonation.model.trainer import FloodRiskModelTrainer
-from flood_risk_zonation.models import FloodRiskResult
+from flood_risk_zonation.models import AnalysisResult, FloodRiskResult
 from flood_risk_zonation.scoring.scorer import FloodRiskScorer
+from flood_risk_zonation.scoring.susceptibility import WeightedSusceptibilityModel
 from flood_risk_zonation.utils.cache import cache_key, get_cache_path, is_cached, load_geodataframe, save_geodataframe
 from flood_risk_zonation.utils.validation import validate_bounding_box, validate_config
 
@@ -70,7 +69,11 @@ class FloodRiskPipeline:
             grid = load_geodataframe(cache_path)
         else:
             logger.info("Generating grid (cell_size=%dm)…", int(config.cell_size_meters))
-            grid = generate_grid(bounding_box, config.cell_size_meters)
+            grid = generate_grid(
+                bounding_box,
+                config.cell_size_meters,
+                max_cells=config.max_grid_cells,
+            )
             if config.use_cache:
                 save_geodataframe(grid, cache_path)
 
@@ -79,24 +82,22 @@ class FloodRiskPipeline:
         # --- Data ingestion — use real data if available, else synthetic fallback ---
         logger.info("Ingesting data...")
         self._data_tier = 3
+        provenance: dict[str, str] = {}
 
         # Elevation — search ALL tif files, not just Gottigere
         elev_dir = Path("data/elevation")
-        tif_files = list(elev_dir.glob("*.tif"))
         elevation = None
-        if tif_files:
+        if elev_dir.exists():
             from flood_risk_zonation.ingest.elevation import load_elevation
-            for tif in tif_files:
-                try:
-                    elevation = load_elevation(bounding_box, tif.parent)
-                    self._data_tier = 1
-                    logger.info("Tier 1: Real SRTM elevation loaded from %s.", tif.name)
-                    break
-                except Exception:
-                    continue
+            try:
+                elevation = load_elevation(bounding_box, elev_dir)
+                logger.info("Real elevation loaded from %s.", elevation.source)
+            except FloodRiskError as exc:
+                logger.warning("Real elevation unavailable (%s).", exc)
         if elevation is None:
             logger.warning("No SRTM file covers this bbox, using synthetic elevation.")
             elevation = generate_synthetic_elevation(bounding_box, resolution_m=500, seed=seed)
+        provenance["elevation"] = elevation.source
 
         # Rainfall
         rain_dir = Path("data/rainfall")
@@ -114,62 +115,59 @@ class FloodRiskPipeline:
         # Water bodies — fetch live from Overpass API for any bbox worldwide
         # Results are cached locally so subsequent runs are instant
         logger.info("Fetching water bodies from Overpass API...")
-        water_bodies = load_water_bodies(bounding_box, data_dir="data/water_bodies")
+        provenance["rainfall"] = rainfall.source
+
+        water_bodies = load_water_bodies(
+            bounding_box,
+            data_dir="data/water_bodies",
+            allow_network=config.allow_network,
+        )
         logger.info("Water bodies loaded: %d features.", len(water_bodies))
-        if len(water_bodies) > 0 and self._data_tier == 3:
-            self._data_tier = 2
+        provenance["water_bodies"] = water_bodies.attrs.get("source", "unavailable")
 
         population = load_population(bounding_box, data_dir=str(config.cache_dir))
         drainage = generate_synthetic_drainage(grid, seed=seed)
+        provenance["population"] = population.source
+        provenance["drainage"] = "synthetic"
+
+        core_real = [
+            provenance["elevation"] != "synthetic",
+            provenance["rainfall"] != "synthetic",
+            provenance["water_bodies"] in {"osm_overpass", "osm_cache"},
+        ]
+        self._data_tier = 1 if all(core_real) else (2 if any(core_real) else 3)
         logger.info("Extracting features for %d cells…", len(grid))
         featured_grid = extract_features(
             grid, elevation, rainfall, water_bodies, population, drainage
         )
 
-        # --- Generate training labels from features ---
-        # High risk = bottom 25% elevation + low drainage + close to water + high TWI
-        # Use top 25% of risk proxy as "High" — realistic distribution
+        # --- Transparent susceptibility model ---
+        # No target labels are fabricated from the input features. The result is
+        # explicitly a relative index whose weights and directions are inspectable.
         X = featured_grid[FEATURE_COLUMNS].copy()
-        risk_score_proxy = (
-            (featured_grid["rainfall_mean_mm"].values / (featured_grid["rainfall_mean_mm"].max() + 1e-6)) * 0.25
-            + (1 - featured_grid["elevation_m"].values / (featured_grid["elevation_m"].max() + 1e-6)) * 0.30
-            + (featured_grid["twi"].values / (featured_grid["twi"].max() + 1e-6)) * 0.20
-            + (1 - featured_grid["drainage_capacity"].values) * 0.15
-            + (1 - featured_grid["dist_water_m"].values / (featured_grid["dist_water_m"].max() + 1e-6)) * 0.10
+        model = WeightedSusceptibilityModel().fit(X)
+        analysis_result = AnalysisResult(
+            model=model,
+            feature_names=list(model.feature_names),
+            feature_importances=model.feature_importances,
+            method="weighted_susceptibility_index",
+            validation_note=(
+                "Relative susceptibility index; not calibrated against observed flood events."
+            ),
         )
-        rng = np.random.default_rng(seed)
-        noise = rng.uniform(-0.05, 0.05, len(featured_grid))
-        y_continuous = np.clip(risk_score_proxy + noise, 0, 1)
-        # Top 25% = High risk (1), rest = Low risk (0) — realistic for flood susceptibility
-        threshold = float(np.percentile(y_continuous, 75))
-        y = pd.Series((y_continuous >= threshold).astype(int), name="high_risk")
-
-        # Safety: ensure at least 2 classes
-        if y.nunique() < 2:
-            threshold = float(np.median(y_continuous))
-            y = pd.Series((y_continuous >= threshold).astype(int), name="high_risk")
-
-        # --- Model training ---
-        logger.info("Training model (%s)…", config.model_type)
-        trainer = FloodRiskModelTrainer(
-            model_type=config.model_type,
-            n_estimators=config.rf_n_estimators,
-            min_samples_leaf=config.rf_min_samples_leaf,
-            random_state=seed,
-        )
-        training_result = trainer.train(X, y, cv_folds=config.cv_folds)
 
         # --- Risk scoring ---
         logger.info("Scoring grid…")
         scorer = FloodRiskScorer()
-        scorer.p_min = trainer.p_min
-        scorer.p_max = trainer.p_max
+        scorer.p_min = 0.0
+        scorer.p_max = 1.0
         thresholds = {"low_max": config.low_threshold, "medium_max": config.medium_threshold}
-        scored_grid = scorer.score_grid(featured_grid, training_result.model, FEATURE_COLUMNS, thresholds)
+        scored_grid = scorer.score_grid(featured_grid, model, FEATURE_COLUMNS, thresholds)
 
         # --- Post-processing: water masking + proximity boosting ---
         scored_grid = self._apply_water_mask_and_proximity_boost(
-            scored_grid, water_bodies, config
+            scored_grid, water_bodies, config,
+            elevation_source=provenance.get("elevation", "synthetic"),
         )
 
         duration = time.time() - t0
@@ -177,11 +175,13 @@ class FloodRiskPipeline:
 
         return FloodRiskResult(
             scored_grid=scored_grid,
-            training_result=training_result,
+            analysis_result=analysis_result,
             bounding_box=bounding_box,
             config=config,
             pipeline_duration_seconds=duration,
             cell_count=len(scored_grid),
+            data_provenance=provenance,
+            data_tier=self._data_tier,
         )
 
     def _apply_water_mask_and_proximity_boost(
@@ -189,42 +189,99 @@ class FloodRiskPipeline:
         scored_grid: gpd.GeoDataFrame,
         water_bodies: gpd.GeoDataFrame,
         config,
+        elevation_source: str = "real",
     ) -> gpd.GeoDataFrame:
         """
-        Global water masking — works for any region worldwide:
+        Post-scoring pipeline:
 
-        1. ELEVATION MASK: cells with elevation <= 1m are ocean/sea/tidal → Water
-        2. OSM POLYGON MASK: cells whose centroid is inside any OSM water polygon → Water
-        3. PROXIMITY BOOST: cells within 0.6× cell_size of any water boundary → boosted risk
+        1. ELEVATION MASK  — cells with elevation ≤ 1 m (SRTM ocean/tidal) → Water
+                             Skipped when elevation_source is "synthetic" or
+                             "offline_sample" to avoid false positives.
+        2. OSM AREA MASK   — cells whose *centroid* lies inside an OSM area water
+                             body (lake, reservoir, bay, coastline) → Water.
+                             Only genuine area features qualify; linear features
+                             (drains, streams, rivers, canals) NEVER mask cells
+                             as Water — they only trigger the proximity boost.
+        3. PROXIMITY BOOST  — land cells whose centroid is within 0.6 × cell_size
+                              of any water geometry (including linear) → boosted risk
+        4. COASTAL FLAG     — land cells within 1.5 × cell_size of ocean/sea
+                              geometry get ``is_coastal_tsunami_risk = True``
         """
         from shapely.geometry import Point
         from shapely.ops import unary_union
 
         result = scored_grid.copy()
 
+        # ── Initialise the coastal tsunami flag column ────────────────────────
+        result["is_coastal_tsunami_risk"] = False
+
         # ── Step 1: Elevation-based sea/ocean mask ────────────────────────────
-        # SRTM assigns 0 or negative values to ocean cells.
-        # Use <= 1m to catch tidal flats and coastal cells too.
-        if "elevation_m" in result.columns:
+        synthetic_sources = {"synthetic", "offline_sample"}
+        apply_elevation_mask = elevation_source not in synthetic_sources
+
+        if apply_elevation_mask and "elevation_m" in result.columns:
             sea_mask = result["elevation_m"].values <= 1.0
             n_sea = int(sea_mask.sum())
             if n_sea > 0:
                 result.loc[sea_mask, "risk_class"] = "Water"
-                result.loc[sea_mask, "risk_score"] = -1.0
-                logger.info("Elevation mask: %d sea/ocean cells (elev <= 1m) → Water.", n_sea)
+                result.loc[sea_mask, "risk_score"] = 0.0
+                logger.info("Elevation mask: %d sea/ocean cells (elev ≤ 1 m) → Water.", n_sea)
+        elif not apply_elevation_mask:
+            logger.debug("Elevation mask skipped (source: %s).", elevation_source)
 
-        # ── Step 2 & 3: OSM polygon mask + proximity boost ───────────────────
+        # ── Steps 2, 3 & 4: OSM-based masking, boost, and coastal flag ───────
         if water_bodies is None or len(water_bodies) == 0:
             return result
 
         try:
             wb_m = water_bodies.to_crs("EPSG:3857")
-            cleaned = wb_m.geometry.buffer(0)
-            valid = cleaned[cleaned.is_valid & ~cleaned.is_empty]
-            if len(valid) == 0:
-                return result
-            water_union = unary_union(valid.values)
 
+            # Water body types that represent genuine area water bodies
+            # (i.e. features that actually cover 2D area on the ground).
+            # Drains, streams, rivers, canals are linear features — they
+            # should boost adjacent cells' risk but NOT mask them as Water.
+            AREA_WATER_TYPES = {"water", "reservoir", "basin", "bay", "coastline", "sea", "ocean"}
+            OCEAN_TYPES = {"coastline", "bay", "sea", "ocean"}
+
+            area_geoms: list = []   # for Water-mask step 2
+            ocean_geoms: list = []  # for coastal tsunami flag step 4
+            all_valid_geoms: list = []  # for proximity boost step 3 (all types)
+
+            for _, wb_row in wb_m.iterrows():
+                geom = wb_row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                geom = geom if geom.is_valid else geom.buffer(0)
+                if geom.is_empty or not geom.is_valid:
+                    continue
+                wtype = str(wb_row.get("water_type", "")).lower()
+                all_valid_geoms.append(geom)
+                if wtype in AREA_WATER_TYPES:
+                    area_geoms.append(geom)
+                if wtype in OCEAN_TYPES:
+                    ocean_geoms.append(geom)
+
+            if not all_valid_geoms:
+                return result
+
+            # Union of ALL water geometries (including linear) — for proximity boost
+            water_union = unary_union(all_valid_geoms)
+
+            # Union of AREA water bodies only — for Water-mask centroid check
+            # We deliberately use centroid-point test here (not cell-polygon
+            # intersection) to avoid thin drain/stream slivers that were stored
+            # as closed polygons from earlier OSM fetches marking every
+            # adjacent cell as Water.
+            area_polygon_geoms = [
+                g for g in area_geoms
+                if g.geom_type in {"Polygon", "MultiPolygon"}
+            ]
+            area_polygon_union = unary_union(area_polygon_geoms) if area_polygon_geoms else None
+
+            # Ocean union for the coastal tsunami flag
+            ocean_union = unary_union(ocean_geoms) if ocean_geoms else None
+
+            # Build centroid GeoSeries in EPSG:3857
             centroid_pts_m = gpd.GeoSeries(
                 [Point(row.centroid_lon, row.centroid_lat) for _, row in result.iterrows()],
                 crs="EPSG:4326",
@@ -233,21 +290,31 @@ class FloodRiskPipeline:
             proximity_m = config.cell_size_meters * 0.6
             already_water = result["risk_class"].values == "Water"
 
-            osm_water = np.array([
-                (not already_water[i]) and water_union.contains(pt)
-                for i, pt in enumerate(centroid_pts_m)
-            ])
-            proximity = np.array([
-                (not already_water[i]) and (not osm_water[i])
-                and pt.distance(water_union) <= proximity_m
-                for i, pt in enumerate(centroid_pts_m)
-            ])
+            # Step 2: centroid lies inside an area water polygon
+            # Using centroid point (not full cell polygon) prevents thin
+            # drain/stream sliver polygons from falsely masking adjacent cells.
+            osm_water = np.zeros(len(result), dtype=bool)
+            if area_polygon_union is not None:
+                for i, pt in enumerate(centroid_pts_m):
+                    if not already_water[i]:
+                        try:
+                            if area_polygon_union.contains(pt):
+                                osm_water[i] = True
+                        except Exception:
+                            pass
 
-            # Apply OSM water mask
+            # Step 3: centroid within proximity of ANY water geometry (incl. linear)
+            proximity = np.zeros(len(result), dtype=bool)
+            for i, pt in enumerate(centroid_pts_m):
+                if not already_water[i] and not osm_water[i]:
+                    if pt.distance(water_union) <= proximity_m:
+                        proximity[i] = True
+
+            # Apply OSM water mask (hard override)
             result.loc[osm_water, "risk_class"] = "Water"
-            result.loc[osm_water, "risk_score"] = -1.0
+            result.loc[osm_water, "risk_score"] = 0.0
 
-            # Apply proximity boost
+            # Apply proximity boost to land cells near water
             boost_floor = config.low_threshold + 5.0
             current = result.loc[proximity, "risk_score"].values
             result.loc[proximity, "risk_score"] = np.maximum(current, boost_floor)
@@ -255,9 +322,24 @@ class FloodRiskPipeline:
                 s = result.at[idx, "risk_score"]
                 result.at[idx, "risk_class"] = "High" if s > config.medium_threshold else "Medium"
 
+            # ── Step 4: Coastal tsunami flag ──────────────────────────────────
+            if ocean_union is not None:
+                coastal_distance_m = config.cell_size_meters * 1.5
+                now_water = result["risk_class"].values == "Water"
+                for i, pt in enumerate(centroid_pts_m):
+                    if not now_water[i]:
+                        if pt.distance(ocean_union) <= coastal_distance_m:
+                            result.iloc[i, result.columns.get_loc("is_coastal_tsunami_risk")] = True
+
+            n_water_final = int((result["risk_class"] == "Water").sum())
+            n_coastal = int(result["is_coastal_tsunami_risk"].sum())
             logger.info(
-                "Water mask complete: %d elevation, %d OSM polygon, %d proximity-boosted.",
-                int(already_water.sum()), int(osm_water.sum()), int(proximity.sum()),
+                "Water mask complete: %d elevation, %d OSM polygon, "
+                "%d proximity-boosted, %d coastal-flagged.",
+                int((result["risk_class"] == "Water").sum() - int(osm_water.sum())) if apply_elevation_mask else 0,
+                int(osm_water.sum()),
+                int(proximity.sum()),
+                n_coastal,
             )
 
         except Exception as e:

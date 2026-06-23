@@ -47,7 +47,7 @@ def test_export_html_creates_file():
         path = Path(tmpdir) / "map.html"
         export_html(m, path)
         assert path.exists()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "<html" in content.lower()
 
 

@@ -85,6 +85,16 @@ class BoundingBox:
         width_km = (self.max_lon - self.min_lon) * 111.32 * cos(radians(center_lat))
         return width_km * height_km
 
+    def width_km(self) -> float:
+        """East-west extent in km."""
+        _, center_lon = self.center
+        center_lat, _ = self.center
+        return (self.max_lon - self.min_lon) * 111.32 * cos(radians(center_lat))
+
+    def height_km(self) -> float:
+        """North-south extent in km."""
+        return (self.max_lat - self.min_lat) * 111.32
+
 
 @dataclass
 class PipelineConfig:
@@ -107,6 +117,8 @@ class PipelineConfig:
     model_artifact_dir: Path = field(default_factory=lambda: Path("model/artifacts"))
     google_maps_api_key: Optional[str] = None
     random_seed: int = 42
+    max_grid_cells: int = 100_000
+    allow_network: bool = False
 
     def __post_init__(self) -> None:
         if self.cell_size_meters <= 0:
@@ -118,3 +130,54 @@ class PipelineConfig:
                 f"low_threshold ({self.low_threshold}) must be strictly less than "
                 f"medium_threshold ({self.medium_threshold})."
             )
+        if not 0.0 <= self.low_threshold <= 100.0:
+            raise ConfigurationError("low_threshold must be within [0, 100].")
+        if not 0.0 <= self.medium_threshold <= 100.0:
+            raise ConfigurationError("medium_threshold must be within [0, 100].")
+        if self.max_grid_cells <= 0:
+            raise ConfigurationError("max_grid_cells must be a positive integer.")
+
+
+# ── Bbox size limits ──────────────────────────────────────────────────────────
+# These constants define the acceptable range for UI-submitted bounding boxes.
+# Using km² area as the primary gate and per-side km as a secondary check so
+# that degenerate thin-strip bboxes are also rejected.
+
+BBOX_MIN_SIDE_KM: float = 2.0    # each side must be at least 2 km
+BBOX_MAX_SIDE_KM: float = 50.0   # each side must be at most 50 km
+
+
+def validate_bbox_size(bbox: BoundingBox) -> str | None:
+    """
+    Check that a BoundingBox is within the acceptable size range for the UI.
+
+    Returns a friendly error string if the bbox is out of range, or None if OK.
+    The check uses latitude-aware degree-to-km conversion (same formula as
+    BoundingBox.area_km2) so it works correctly at any latitude.
+
+    Parameters
+    ----------
+    bbox : BoundingBox
+
+    Returns
+    -------
+    str | None
+        Human-readable error message, or None if the bbox is acceptable.
+    """
+    center_lat = (bbox.min_lat + bbox.max_lat) / 2.0
+    height_km = (bbox.max_lat - bbox.min_lat) * 111.32
+    width_km = (bbox.max_lon - bbox.min_lon) * 111.32 * cos(radians(center_lat))
+
+    if width_km < BBOX_MIN_SIDE_KM or height_km < BBOX_MIN_SIDE_KM:
+        return (
+            f"Selected area is too small ({width_km:.1f} km × {height_km:.1f} km). "
+            f"Please select an area at least {BBOX_MIN_SIDE_KM:.0f} km wide and tall "
+            "for meaningful results."
+        )
+    if width_km > BBOX_MAX_SIDE_KM or height_km > BBOX_MAX_SIDE_KM:
+        return (
+            f"Selected area is too large ({width_km:.1f} km × {height_km:.1f} km). "
+            f"Please select an area no more than {BBOX_MAX_SIDE_KM:.0f} km wide and tall "
+            "to keep processing times reasonable."
+        )
+    return None

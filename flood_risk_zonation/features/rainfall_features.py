@@ -78,6 +78,12 @@ def extract_rainfall_features(
     """
     lons = grid["centroid_lon"].values.astype(np.float64)
     lats = grid["centroid_lat"].values.astype(np.float64)
+    if rainfall_dataset.crs is not None:
+        from pyproj import CRS, Transformer
+        rainfall_crs = CRS.from_user_input(rainfall_dataset.crs)
+        if rainfall_crs != CRS.from_epsg(4326):
+            transformer = Transformer.from_crs("EPSG:4326", rainfall_crs, always_xy=True)
+            lons, lats = transformer.transform(lons, lats)
 
     mean_annual = _sample_raster_at_points(
         rainfall_dataset.mean_annual_mm,

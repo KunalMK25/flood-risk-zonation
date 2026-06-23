@@ -32,7 +32,7 @@ def test_html_export_creates_valid_file(pipeline_result):
         path = Path(tmpdir) / "map.html"
         export_html(m, path)
         assert path.exists()
-        assert "<html" in path.read_text().lower()
+        assert "<html" in path.read_text(encoding="utf-8").lower()
 
 
 def test_geojson_export_is_valid(pipeline_result):

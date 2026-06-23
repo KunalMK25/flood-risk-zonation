@@ -66,7 +66,7 @@ def _feature_importance_chart(importances: dict) -> io.BytesIO:
     fig, ax = plt.subplots(figsize=(7, 3))
     bars = ax.barh(labels, vals, color="#3498db", edgecolor="white")
     ax.set_xlabel("Importance Score", fontsize=9)
-    ax.set_title("Top Feature Importances (Random Forest)", fontsize=10, fontweight="bold")
+    ax.set_title("Flood Susceptibility Factor Weights", fontsize=10, fontweight="bold")
     ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
     for bar, val in zip(bars, vals):
         ax.text(val + 0.002, bar.get_y() + bar.get_height()/2, f"{val:.3f}", va="center", fontsize=8)
@@ -157,9 +157,9 @@ def _risk_zone_parameters_table(result, styles) -> list:
     story.append(tt)
     story.append(Spacer(1, 0.3*cm))
 
-    # Feature weights table — area-specific from actual model
-    story.append(Paragraph("Feature Weights for This Area (from ML Model)", styles["SectionHead"]))
-    fi = result.training_result.feature_importances
+    # Declared factor weights used by the transparent susceptibility index.
+    story.append(Paragraph("Declared Susceptibility Factor Weights", styles["SectionHead"]))
+    fi = result.analysis_result.feature_importances
     fi_interp = {
         "elevation_m": "Lower = higher risk", "twi": "Higher = more water accumulation",
         "drainage_capacity": "Lower = worse drainage", "dist_water_m": "Closer = higher risk",
@@ -257,10 +257,11 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
     dist = result.risk_distribution
     grid = result.scored_grid
     total_cells = sum(v for k, v in dist.items() if k != "Water")
-    tier_label = {1: "Tier 1 — Real SRTM + OSM + IMD Data", 2: "Tier 2 — Partial Real Data", 3: "Tier 3 — Synthetic Data"}
+    data_tier = result.data_tier
+    tier_label = {1: "Tier 1 — Real elevation + rainfall + OSM", 2: "Tier 2 — Partial Real Data", 3: "Tier 3 — Synthetic Data"}
     story.append(Paragraph("FLOOD RISK ZONATION REPORT", styles["Title2"]))
     story.append(Paragraph(f"{area_name}", styles["Subtitle"]))
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%d %B %Y, %H:%M')}  |  Data: {tier_label.get(data_tier, 'Unknown')}  |  Model: Random Forest (AUC: {result.training_result.mean_cv_auc:.3f})", styles["Caption"]))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%d %B %Y, %H:%M')}  |  Data: {tier_label.get(data_tier, 'Unknown')}  |  Method: Weighted susceptibility index", styles["Caption"]))
     story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#1a5276"), spaceAfter=12))
     story.append(Paragraph("1. Study Area & Data Summary", styles["SectionHead"]))
     meta_data = [
@@ -272,8 +273,8 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
         ["Total Grid Cells", str(result.cell_count)],
         ["Analysis Duration", f"{result.pipeline_duration_seconds:.1f} seconds"],
         ["Data Source", tier_label.get(data_tier, "Unknown")],
-        ["ML Model", f"Random Forest (n_estimators={result.config.rf_n_estimators}, CV folds={result.config.cv_folds})"],
-        ["Model AUC-ROC", f"{result.training_result.mean_cv_auc:.4f}"],
+        ["Analysis Method", "Transparent weighted susceptibility index"],
+        ["Validation Status", result.analysis_result.validation_note],
         ["Analysis Date", datetime.now().strftime("%d %B %Y")],
     ]
     t = Table(meta_data, colWidths=[6*cm, 11*cm])
@@ -345,6 +346,16 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
             cnt = dist[rc]
             pct = f"{cnt/result.cell_count*100:.1f}%" if result.cell_count > 0 else "—"
             summary_data.append([rc, str(cnt), pct, interp.get(rc, "")])
+    # Coastal tsunami flag summary row
+    n_coastal = int(result.scored_grid.get("is_coastal_tsunami_risk", False).sum()) \
+        if "is_coastal_tsunami_risk" in result.scored_grid.columns else 0
+    if n_coastal > 0:
+        summary_data.append([
+            "⚠️ Coastal",
+            str(n_coastal),
+            f"{n_coastal/result.cell_count*100:.1f}%",
+            "Adjacent to ocean/sea — additional tsunami inundation risk",
+        ])
     st2 = Table(summary_data, colWidths=[3*cm, 3*cm, 3*cm, 8*cm])
     st2_style = [
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1a5276")),
@@ -361,6 +372,10 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
             st2_style.append(("BACKGROUND", (0,i), (-1,i), RISK_BG[rc]))
             st2_style.append(("TEXTCOLOR", (0,i), (0,i), RISK_COLORS[rc]))
             st2_style.append(("FONTNAME", (0,i), (0,i), "Helvetica-Bold"))
+        elif rc == "⚠️ Coastal":
+            st2_style.append(("BACKGROUND", (0,i), (-1,i), colors.HexColor("#fef0e6")))
+            st2_style.append(("TEXTCOLOR", (0,i), (0,i), colors.HexColor("#d35400")))
+            st2_style.append(("FONTNAME", (0,i), (0,i), "Helvetica-Bold"))
     st2.setStyle(TableStyle(st2_style))
     story.append(st2); story.append(Spacer(1, 0.4*cm))
     chart_buf = _make_chart_buf = _risk_distribution_chart(dist)
@@ -375,10 +390,10 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
     else:
         story.append(Paragraph("No significant vulnerability factors identified.", styles["Body"]))
     story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph("5. Feature Importance — Key Flood Risk Drivers", styles["SectionHead"]))
-    fi_buf = _feature_importance_chart(result.training_result.feature_importances)
+    story.append(Paragraph("5. Factor Weights — Key Flood Susceptibility Drivers", styles["SectionHead"]))
+    fi_buf = _feature_importance_chart(result.analysis_result.feature_importances)
     story.append(Image(fi_buf, width=15*cm, height=5.5*cm))
-    story.append(Paragraph("Figure 2: Random Forest feature importances — higher score = stronger predictor of flood risk.", styles["Caption"]))
+    story.append(Paragraph("Figure 2: Declared index weights — higher values contribute more strongly to the relative score.", styles["Caption"]))
     story.append(Spacer(1, 0.3*cm))
     fi_table_data = [["Feature", "Importance", "Interpretation"]]
     fi_interp = {
@@ -393,7 +408,7 @@ def export_pdf_report(result, output_path: str | Path, area_name: str = "Study A
         "aspect_deg": "Terrain orientation affects solar drying and runoff direction",
         "curvature": "Concave terrain (negative curvature) accumulates water",
     }
-    for feat, imp in sorted(result.training_result.feature_importances.items(), key=lambda x: x[1], reverse=True):
+    for feat, imp in sorted(result.analysis_result.feature_importances.items(), key=lambda x: x[1], reverse=True):
         fi_table_data.append([feat.replace("_", " ").title(), f"{imp:.4f}", fi_interp.get(feat, "—")])
     fi_t = Table(fi_table_data, colWidths=[4.5*cm, 2.5*cm, 10*cm])
     fi_t.setStyle(TableStyle([

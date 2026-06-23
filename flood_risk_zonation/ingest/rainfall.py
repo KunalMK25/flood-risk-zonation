@@ -52,40 +52,62 @@ def load_rainfall(bounding_box: BoundingBox, data_dir: Path | str) -> RainfallDa
         )
         return generate_synthetic_rainfall(bounding_box, seed=42)
 
-    try:
-        import rasterio
-        tif_path = tif_files[0]
-        with rasterio.open(tif_path) as src:
-            from rasterio.windows import from_bounds as window_from_bounds
-            window = window_from_bounds(
-                bounding_box.min_lon, bounding_box.min_lat,
-                bounding_box.max_lon, bounding_box.max_lat,
-                src.transform,
-            )
-            mean_annual = src.read(1, window=window).astype(np.float32)
-            # If second band exists, use it for max_24h; otherwise derive from mean
-            if src.count >= 2:
-                max_24h = src.read(2, window=window).astype(np.float32)
-            else:
-                max_24h = (mean_annual / 365.0 * 5.0).astype(np.float32)
+    import rasterio
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import from_bounds as window_from_bounds
 
-            mean_annual = impute_missing_values(mean_annual)
-            max_24h = impute_missing_values(max_24h)
+    errors: list[str] = []
+    for tif_path in sorted(tif_files):
+        try:
+            with rasterio.open(tif_path) as src:
+                if src.crs is None:
+                    continue
+                left, bottom, right, top = transform_bounds(
+                    "EPSG:4326",
+                    src.crs,
+                    bounding_box.min_lon,
+                    bounding_box.min_lat,
+                    bounding_box.max_lon,
+                    bounding_box.max_lat,
+                )
+                bounds = src.bounds
+                if right <= bounds.left or left >= bounds.right or top <= bounds.bottom or bottom >= bounds.top:
+                    continue
+                window = window_from_bounds(
+                    max(left, bounds.left),
+                    max(bottom, bounds.bottom),
+                    min(right, bounds.right),
+                    min(top, bounds.top),
+                    src.transform,
+                ).round_offsets().round_lengths()
+                mean_annual = src.read(1, window=window).astype(np.float32)
+                if mean_annual.size == 0:
+                    continue
+                if src.count >= 2:
+                    max_24h = src.read(2, window=window).astype(np.float32)
+                else:
+                    max_24h = (mean_annual / 365.0 * 5.0).astype(np.float32)
+                if src.nodata is not None:
+                    mean_annual[mean_annual == src.nodata] = np.nan
+                    max_24h[max_24h == src.nodata] = np.nan
+                mean_annual = impute_missing_values(mean_annual)
+                max_24h = impute_missing_values(max_24h)
+                return RainfallDataset(
+                    mean_annual_mm=mean_annual,
+                    max_24h_mm=max_24h,
+                    transform=src.window_transform(window),
+                    crs=src.crs,
+                    temporal_range=(date(2001, 1, 1), date(2023, 12, 31)),
+                    source=str(tif_path),
+                )
+        except Exception as exc:
+            errors.append(f"{tif_path.name}: {exc}")
 
-            transform = src.window_transform(window)
-            crs = src.crs
-
-        return RainfallDataset(
-            mean_annual_mm=mean_annual,
-            max_24h_mm=max_24h,
-            transform=transform,
-            crs=crs,
-            temporal_range=(date(2001, 1, 1), date(2023, 12, 31)),
-            source="GPM_IMERG",
-        )
-    except Exception as exc:
-        logger.warning("Failed to load rainfall data: %s. Using synthetic fallback.", exc)
-        return generate_synthetic_rainfall(bounding_box, seed=42)
+    logger.warning(
+        "No rainfall raster covers the requested area%s. Using synthetic fallback.",
+        f" ({'; '.join(errors)})" if errors else "",
+    )
+    return generate_synthetic_rainfall(bounding_box, seed=42)
 
 
 def generate_synthetic_rainfall(

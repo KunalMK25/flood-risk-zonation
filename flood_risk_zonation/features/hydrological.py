@@ -76,7 +76,14 @@ def compute_distance_to_water(
         if nearest_idx is None:
             distances[i] = MAX_DISTANCE_M
             continue
-        idx = int(np.asarray(nearest_idx).flat[0])
+        nearest_array = np.asarray(nearest_idx)
+        # GeoPandas returns a 2 x N array: query indexes in row 0 and tree
+        # indexes in row 1. A scalar/1-D result is retained for compatibility
+        # with older spatial-index implementations.
+        if nearest_array.ndim == 2 and nearest_array.shape[0] == 2:
+            idx = int(nearest_array[1, 0])
+        else:
+            idx = int(nearest_array.flat[-1])
         nearest_geom = wb_m.geometry.iloc[idx]
         dist = centroid_geom.distance(nearest_geom)
         distances[i] = min(dist, MAX_DISTANCE_M)

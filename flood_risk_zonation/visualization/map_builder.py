@@ -9,6 +9,7 @@ import folium
 import geopandas as gpd
 import numpy as np
 
+from flood_risk_zonation.visualization.explainability import build_cell_explanation
 from flood_risk_zonation.visualization.layers import (
     RISK_COLOR_MAP,
     add_drainage_lines_layer,
@@ -19,6 +20,10 @@ from flood_risk_zonation.visualization.layers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of cells that receive interactive explainability
+# (tooltip + popup). Beyond this, performance degrades noticeably.
+_MAX_EXPLAINABLE_CELLS = 500
 
 
 class FloodRiskMapBuilder:
@@ -34,17 +39,32 @@ class FloodRiskMapBuilder:
         use_google_maps: bool = False,
         google_maps_api_key: str | None = None,
         water_bodies: gpd.GeoDataFrame | None = None,
+        model_bounds: dict | None = None,
     ) -> folium.Map:
         """
         Construct a Folium map with risk choropleth, drainage lines,
         rainfall heatmap, population, and water body layers.
+
+        Parameters
+        ----------
+        scored_grid : gpd.GeoDataFrame
+            Scored grid with risk_class, risk_score, feature columns, and
+            optional is_coastal_tsunami_risk column.
+        center : tuple[float, float]
+            (lat, lon) map center.
+        zoom_start : int
+            Initial zoom level.
+        model_bounds : dict | None
+            Fitted normalisation bounds from WeightedSusceptibilityModel
+            ({feature: (lower, upper)}). Passed to per-cell explanation for
+            accurate bar scaling. If None, falls back to fixed reference ranges.
         """
         m = folium.Map(location=list(center), zoom_start=zoom_start, tiles="OpenStreetMap")
 
-        # Layer 1: Risk classification choropleth (always on)
+        # Layer 1: Risk classification choropleth (color fill, no interactivity)
         add_risk_choropleth_layer(m, scored_grid)
 
-        # Layer 2: Drainage lines (always on — key for justifying risk)
+        # Layer 2: Drainage lines
         add_drainage_lines_layer(m)
 
         # Layer 3: Rainfall heatmap (toggle)
@@ -57,76 +77,92 @@ class FloodRiskMapBuilder:
         if water_bodies is not None:
             add_water_bodies_layer(m, water_bodies)
 
-        # Layer control
-        folium.LayerControl(collapsed=False).add_to(m)
+        # Per-cell hover tooltips + click popups — added BEFORE LayerControl
+        # so they sit on top in Leaflet's z-order and receive mouse events.
+        self.add_cell_explainability_layer(m, scored_grid, model_bounds=model_bounds)
 
-        # Rich popups with risk factor breakdown
-        self.add_popup_layer(m, scored_grid)
+        # Layer control added last so it indexes all layers including Cell Info
+        folium.LayerControl(collapsed=False).add_to(m)
 
         return m
 
-    def add_popup_layer(self, folium_map: folium.Map, grid: gpd.GeoDataFrame) -> folium.Map:
+    def add_cell_explainability_layer(
+        self,
+        folium_map: folium.Map,
+        grid: gpd.GeoDataFrame,
+        model_bounds: dict | None = None,
+    ) -> folium.Map:
         """
-        Add click-to-inspect popups. Only adds popups for non-Water cells
-        to keep map performance fast for large coastal grids.
+        Add hover tooltips (quick summary) and click popups (full breakdown)
+        to each grid cell.
+
+        - All risk classes get a tooltip (visible on hover).
+        - All risk classes get a popup (visible on click).
+        - Water cells show a water-specific explanation (no factor bars).
+        - Coastal cells show the ⚠️ Tsunami Risk badge.
+        - Capped at _MAX_EXPLAINABLE_CELLS total (prioritises High-risk cells,
+          then others) to keep page load times acceptable.
+
+        Parameters
+        ----------
+        model_bounds : dict | None
+            {feature_name: (lower_5th_pct, upper_95th_pct)} from the fitted
+            WeightedSusceptibilityModel. Used to scale factor bars relative
+            to the actual data distribution, not fixed ranges.
         """
-        # Precompute max values for bar scaling
-        def _max(col):
-            return float(grid[col].max()) if col in grid.columns and grid[col].max() > 0 else 1.0
+        fg = folium.FeatureGroup(name="Cell Info (hover/click)", show=True)
 
-        elev_max = _max("elevation_m")
-        rain_max = _max("rainfall_mean_mm")
-        twi_max = _max("twi")
-        dist_max = _max("dist_water_m")
+        # Prioritise cells for display: High first, then Water, Medium, Low
+        priority_order = {"High": 0, "Water": 1, "Medium": 2, "Low": 3}
+        grid_sorted = grid.copy()
+        grid_sorted["_priority"] = grid_sorted["risk_class"].map(
+            lambda c: priority_order.get(str(c), 9)
+        )
+        grid_sorted = grid_sorted.sort_values("_priority").head(_MAX_EXPLAINABLE_CELLS)
 
-        fg = folium.FeatureGroup(name="Cell Info (click)", show=False)
+        for _, row in grid_sorted.iterrows():
+            try:
+                tooltip_html, popup_html = build_cell_explanation(row, model_bounds)
+            except Exception as e:
+                logger.debug("Skipping cell explanation: %s", e)
+                continue
 
-        # Limit to max 300 cells for popup performance
-        display_grid = grid[grid.risk_class != "Water"].head(300)
+            # Use folium.Polygon (not GeoJson) for per-cell interactivity.
+            # GeoJson bulk-renders multiple features as one Leaflet layer and
+            # can miss individual mouse events. Polygon creates one L.polygon
+            # per cell, guaranteeing tooltip/popup fire correctly on hover/click.
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
 
-        for _, row in display_grid.iterrows():
-            risk_class = str(row.get("risk_class", "Low"))
-            risk_score = row.get("risk_score", 0)
-            risk_color = RISK_COLOR_MAP.get(risk_class, "#999")
+            # Extract exterior ring coords as (lat, lon) pairs for folium.Polygon
+            try:
+                if geom.geom_type == "Polygon":
+                    coords = [(lat, lon) for lon, lat in geom.exterior.coords]
+                elif geom.geom_type == "MultiPolygon":
+                    # Use largest polygon
+                    largest = max(geom.geoms, key=lambda g: g.area)
+                    coords = [(lat, lon) for lon, lat in largest.exterior.coords]
+                else:
+                    continue
+            except Exception:
+                continue
 
-            def _bar(value, max_val, reverse=False):
-                pct = min(100, int(value / max_val * 100)) if max_val > 0 else 0
-                if reverse:
-                    pct = 100 - pct
-                color = "#e74c3c" if pct > 66 else "#f39c12" if pct > 33 else "#2ecc71"
-                return (
-                    f'<div style="background:#ddd;border-radius:3px;height:8px;'
-                    f'width:100px;display:inline-block">'
-                    f'<div style="background:{color};width:{pct}%;height:8px;'
-                    f'border-radius:3px"></div></div> <small>{pct}%</small>'
-                )
-
-            elev = float(row.get("elevation_m", 0))
-            rain = float(row.get("rainfall_mean_mm", 0))
-            drain = float(row.get("drainage_capacity", 0.5))
-            dist = float(row.get("dist_water_m", 5000))
-            twi = float(row.get("twi", 0))
-            slope = float(row.get("slope_deg", 0))
-
-            html = f"""<div style="font-family:Arial,sans-serif;font-size:12px;min-width:220px">
-  <div style="background:{risk_color};color:white;padding:4px 8px;border-radius:4px;margin-bottom:6px">
-    <b>{risk_class} Risk</b> &nbsp; Score: {risk_score:.1f}/100
-  </div>
-  <table style="width:100%;border-collapse:collapse">
-    <tr><td style="padding:2px 4px"><b>🌧 Rainfall</b></td><td>{_bar(rain, rain_max)}</td><td style="padding-left:4px">{rain:.0f}mm</td></tr>
-    <tr><td style="padding:2px 4px"><b>⛰ Elevation</b></td><td>{_bar(elev, elev_max, reverse=True)}</td><td style="padding-left:4px">{elev:.0f}m</td></tr>
-    <tr><td style="padding:2px 4px"><b>💧 TWI</b></td><td>{_bar(twi, twi_max)}</td><td style="padding-left:4px">{twi:.2f}</td></tr>
-    <tr><td style="padding:2px 4px"><b>🚰 Drainage</b></td><td>{_bar(1-drain, 1.0)}</td><td style="padding-left:4px">{drain:.2f}</td></tr>
-    <tr><td style="padding:2px 4px"><b>🏞 Dist Water</b></td><td>{_bar(dist, dist_max, reverse=True)}</td><td style="padding-left:4px">{dist:.0f}m</td></tr>
-    <tr><td style="padding:2px 4px"><b>📐 Slope</b></td><td>{_bar(slope, 45.0, reverse=True)}</td><td style="padding-left:4px">{slope:.1f}°</td></tr>
-  </table>
-</div>"""
-
-            folium.GeoJson(
-                row.geometry.__geo_interface__,
-                style_function=lambda _: {"fillOpacity": 0, "weight": 0},
-                popup=folium.Popup(html, max_width=300),
+            folium.Polygon(
+                locations=coords,
+                color="transparent",
+                fill=True,
+                fill_color="transparent",
+                fill_opacity=0.0,
+                weight=0,
+                tooltip=folium.Tooltip(tooltip_html, sticky=True),
+                popup=folium.Popup(popup_html, max_width=320),
             ).add_to(fg)
 
         fg.add_to(folium_map)
         return folium_map
+
+    # ── Backward-compat alias ─────────────────────────────────────────────────
+    def add_popup_layer(self, folium_map: folium.Map, grid: gpd.GeoDataFrame) -> folium.Map:
+        """Deprecated alias — calls add_cell_explainability_layer."""
+        return self.add_cell_explainability_layer(folium_map, grid)
