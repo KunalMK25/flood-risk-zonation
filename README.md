@@ -22,7 +22,7 @@ A geospatial web app that generates **flood risk zone maps** for any region worl
 | 🗺️ Interactive Risk Map | Color-coded flood risk zones (High / Medium / Low / Water) via Folium |
 | 🌍 Global Coverage | Works for any bounding box worldwide using live OpenStreetMap data |
 | ⛰️ Real Elevation Data | NASA SRTM 30m DEM via local GeoTIFF; synthetic fallback |
-| 💧 Live Water Body Detection | Fetches lakes, rivers, canals, ocean from OSM Overpass API (with retry + local cache) |
+| 💧 Water & Ocean Detection | Live OSM Overpass API fetching for inland lakes/rivers + high-performance deterministic Natural Earth land/sea mask for ocean cells |
 | 🌧️ Rainfall Layer | IMD/GPM-calibrated rainfall intensity heatmap |
 | 🔍 Per-cell Explainability | Click any cell for a data-driven factor breakdown with risk contribution bars |
 | ⚠️ Coastal Tsunami Flag | Cells within 1.5× cell-size of ocean/sea geometry are flagged in the popup |
@@ -66,7 +66,12 @@ flood-risk-zonation/
 │       ├── export.py           # CSV / GeoJSON / HTML export
 │       └── pdf_report.py       # ReportLab PDF generator
 ├── tests/                      # pytest + Hypothesis property-based tests
+│   ├── integration/
+│   │   └── test_reference_regions.py  # Parametrised five-region verification
+│   └── ...
 ├── data/                       # Sample/cached data
+│   └── landmask/
+│       └── ne_50m_land.geojson  # Bundled Natural Earth 1:50m land polygon
 ├── .streamlit/                 # Streamlit theme config
 ├── .github/
 │   └── workflows/
@@ -99,7 +104,7 @@ Bounding Box Input
 5. Risk Scoring           — normalises model output → [0, 100] → Low / Medium / High
        │
        ▼
-6. Post-processing        — water masking (elevation + OSM polygon centroid test)
+6. Post-processing        — water masking (static Natural Earth land mask + OSM polygon coverage)
        │                    proximity boost for cells near water
        │                    coastal tsunami flag for cells near ocean/sea
        ▼
@@ -181,8 +186,8 @@ The pipeline applies a four-step post-scoring pass:
 
 | Step | Description |
 |---|---|
-| Elevation mask | Cells with SRTM elevation ≤ 1 m → Water (skipped for synthetic elevation) |
-| OSM polygon mask | Cells whose centroid lies inside an OSM area water body (lake, reservoir, bay, ocean) → Water |
+| Ocean detector | Point-in-polygon lookup against a static Natural Earth 1:50m land polygon (cells outside land → Water) |
+| OSM polygon mask | Cells with ≥ 80% coverage by inland water bodies (ponds, reservoirs) or ≥ 60% coverage by sea/bay polygons → Water |
 | Proximity boost | Land cells within 0.6 × cell_size of any water geometry → boosted to at least Medium |
 | Coastal flag | Land cells within 1.5 × cell_size of ocean/sea geometry → `is_coastal_tsunami_risk = True` flag shown in popup |
 
