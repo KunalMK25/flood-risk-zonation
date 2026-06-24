@@ -31,6 +31,32 @@ from flood_risk_zonation.utils.validation import validate_bounding_box, validate
 
 logger = logging.getLogger(__name__)
 
+_LAND_MASK_PATH = Path(__file__).parent.parent / "data" / "landmask" / "ne_50m_land.geojson"
+_LAND_MASK_GEOM: "shapely.geometry.base.BaseGeometry | None" = None
+
+
+def _load_land_mask():
+    """Load and cache the Natural Earth land polygon from disk.
+
+    Returns the dissolved land geometry (a single Shapely BaseGeometry).
+    Raises FloodRiskError if the file is missing, unparseable, or empty.
+    """
+    global _LAND_MASK_GEOM
+    if _LAND_MASK_GEOM is not None:
+        return _LAND_MASK_GEOM
+    if not _LAND_MASK_PATH.exists():
+        raise FloodRiskError(f"Land mask file not found: {_LAND_MASK_PATH}")
+    try:
+        gdf = gpd.read_file(_LAND_MASK_PATH)
+    except Exception as exc:
+        raise FloodRiskError(f"Failed to parse land mask: {exc}") from exc
+    from shapely.ops import unary_union as _unary_union
+    geom = _unary_union(gdf.geometry.tolist())
+    if geom is None or geom.is_empty:
+        raise FloodRiskError("Land mask geometry is empty after dissolve")
+    _LAND_MASK_GEOM = geom
+    return _LAND_MASK_GEOM
+
 
 class FloodRiskPipeline:
     """
@@ -306,57 +332,56 @@ class FloodRiskPipeline:
                     elif wtype not in LINEAR_TYPES:
                         area_water_geoms.append(geom)
 
-        # Step 1: elevation mask (ocean detector)
-        # Real SRTM via OpenTopoData returns ocean pixels as 0 m.
-        # CRITICAL guards:
-        # (a) Only apply if OSM coastline data is present nearby — prevents
-        #     inland low-lying land (Adyar ~1m) from being falsely masked.
-        # (b) For Dal Lake and similar: SRTM also returns 0m for lake surfaces.
-        #     These are correctly handled by the OSM polygon coverage mask (step 2).
-        #     The elevation mask should only fire for ocean, not for lake surfaces.
-        #     We detect this by requiring the cell to be near a coastline feature.
-        synthetic_sources = {"synthetic", "offline_sample"}
-        if elevation_source not in synthetic_sources and "elevation_m" in result.columns and boost_geoms:
-            has_coastline = False
-            if water_bodies is not None and len(water_bodies) > 0:
-                for _, row in water_bodies.iterrows():
-                    if str(row.get("water_type", "")).lower() in {"coastline", "bay", "sea", "ocean"}:
-                        has_coastline = True
-                        break
-            if has_coastline:
-                # Only mask low-elevation cells that are near a coastline feature
+        # Ocean_Detector: point-in-polygon check against the static Natural Earth land mask.
+        # Cells whose centroid is NOT inside the land polygon are classified as ocean → Water.
+        # This replaces the deleted coastline-LineString polygonization path.
+        try:
+            land_geom = _load_land_mask()
+            from shapely.geometry import box as shapely_box
+
+            lon_min = float(result["centroid_lon"].min())
+            lon_max = float(result["centroid_lon"].max())
+            lat_min = float(result["centroid_lat"].min())
+            lat_max = float(result["centroid_lat"].max())
+            grid_bbox = shapely_box(lon_min, lat_min, lon_max, lat_max)
+
+            try:
+                land_clipped = land_geom.intersection(grid_bbox)
+                ocean_in_bbox = grid_bbox.difference(land_clipped)
+            except Exception as _bbox_exc:
+                logger.warning("Ocean_Detector: bbox geometry failed: %s", _bbox_exc)
+                land_clipped = None
+                ocean_in_bbox = None
+
+            already_water = result["risk_class"].values == "Water"
+            ocean_mask = np.zeros(len(result), dtype=bool)
+            for i, (_, r) in enumerate(result.iterrows()):
+                if already_water[i]:
+                    continue
                 try:
-                    coastline_geoms_m = []
-                    wb_m_coast = water_bodies.to_crs("EPSG:3857")
-                    for _, row in wb_m_coast.iterrows():
-                        if str(row.get("water_type", "")).lower() in {"coastline", "bay", "sea", "ocean"}:
-                            g = row.geometry
-                            if g is not None and not g.is_empty:
-                                coastline_geoms_m.append(g if g.is_valid else g.buffer(0))
-                    if coastline_geoms_m:
-                        coast_union_m = unary_union(coastline_geoms_m)
-                        coast_proximity_m = config.cell_size_meters * 2.0
-                        centroid_pts_coast = _gpd.GeoSeries(
-                            [Point(r.centroid_lon, r.centroid_lat) for _, r in result.iterrows()],
-                            crs="EPSG:4326",
-                        ).to_crs("EPSG:3857")
-                        near_coast = np.array([
-                            pt.distance(coast_union_m) <= coast_proximity_m
-                            for pt in centroid_pts_coast
-                        ])
-                        # Threshold: 0m = SRTM ocean surface. Low coastal land
-                        # (1-5m) is NOT masked as Water — only true ocean pixels (0m).
-                        sea_mask = (result["elevation_m"].values <= 0.0) & near_coast
-                        n_sea = int(sea_mask.sum())
-                        if n_sea > 0:
-                            result.loc[sea_mask, "risk_class"] = "Water"
-                            result.loc[sea_mask, "risk_score"] = 0.0
-                            result.loc[sea_mask, "water_mask_reason"] = "elevation"
-                            logger.info("Elevation+coastline mask: %d cells -> Water.", n_sea)
-                except Exception as exc:
-                    logger.warning("Elevation+coastline mask failed: %s", exc)
-            # No coastline: do NOT apply elevation mask at all
-            # (lake surfaces also return 0m in SRTM — handled by OSM polygon mask)
+                    pt = Point(r["centroid_lon"], r["centroid_lat"])
+                    if not land_geom.contains(pt):
+                        ocean_mask[i] = True
+                except Exception as _cell_exc:
+                    logger.warning(
+                        "Ocean_Detector: cell %d geometry error (%s) — treating as land.",
+                        i, _cell_exc,
+                    )
+
+            if ocean_mask.any():
+                result.loc[ocean_mask, "risk_class"] = "Water"
+                result.loc[ocean_mask, "risk_score"] = 0.0
+                result.loc[ocean_mask, "water_mask_reason"] = "landmask"
+                logger.info(
+                    "Ocean_Detector (land mask): %d cells classified as Water.",
+                    int(ocean_mask.sum()),
+                )
+                if ocean_in_bbox is not None and not ocean_in_bbox.is_empty:
+                    ocean_area_geoms.append(ocean_in_bbox)
+                    boost_geoms.append(ocean_in_bbox)
+        except Exception as _det_exc:
+            logger.warning("Ocean_Detector failed: %s — skipping ocean classification.", _det_exc)
+
 
         # Step 2: OSM polygon coverage mask (lakes, ponds, reservoirs)
         # Use 80% threshold for inland water bodies to avoid false masking

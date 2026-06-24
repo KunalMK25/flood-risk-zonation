@@ -42,7 +42,7 @@ def test_pipeline_output_completeness(bbox):
     assert not grid["risk_score"].isna().any()
     assert not grid["risk_class"].isna().any()
     assert grid["risk_score"].between(0.0, 100.0).all()
-    assert set(grid["risk_class"].unique()).issubset({"Low", "Medium", "High"})
+    assert set(grid["risk_class"].unique()).issubset({"Low", "Medium", "High", "Water"})
 
 
 @given(bbox=valid_bboxes)

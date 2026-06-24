@@ -10,6 +10,8 @@ from __future__ import annotations
 import geopandas as gpd
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from shapely.geometry import Point, Polygon, box
 
 from flood_risk_zonation.config import BoundingBox, PipelineConfig
@@ -104,38 +106,6 @@ class TestWaterMaskingHardOverride:
             "Water mask must override High risk classification"
         )
 
-    def test_elevation_mask_fires_for_low_elevation(self):
-        """Cells with elevation == 0 m near a coastline get Water class (SRTM ocean = 0m)."""
-        from shapely.geometry import LineString
-        grid = _make_grid([77.55, 77.56], [12.84, 12.84], [0.0, 50.0])
-        # Coastline very close to the cell (within 2x cell_size)
-        coastline_gdf = gpd.GeoDataFrame(
-            {"geometry": [LineString([(77.50, 12.838), (77.60, 12.838)])],
-             "water_type": ["coastline"], "name": [""]},
-            crs="EPSG:4326",
-        )
-        result = _pipeline()._apply_water_mask_and_proximity_boost(
-            grid, coastline_gdf, _config(cell_size=500.0), elevation_source="real"
-        )
-        assert result.iloc[0]["risk_class"] == "Water", "0 m cell near coastline must be masked as Water"
-        assert result.iloc[1]["risk_class"] != "Water", "50 m cell must remain land"
-        assert result.iloc[0]["risk_class"] == "Water", "0.5 m cell must be masked as Water"
-        assert result.iloc[1]["risk_class"] != "Water", "50 m cell must remain land"
-
-    def test_elevation_mask_skipped_for_synthetic_data(self):
-        """Synthetic elevation must NOT trigger Water masking for low-value cells."""
-        # A coastal synthetic DEM may produce values below 1 m even over urban land
-        grid = _make_grid([80.25, 80.26], [13.00, 13.00], [0.4, 50.0])
-        empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-        result = _pipeline()._apply_water_mask_and_proximity_boost(
-            grid, empty_wb, _config(), elevation_source="synthetic"
-        )
-        # Neither cell should be masked as Water — no OSM data, synthetic elevation
-        assert result.iloc[0]["risk_class"] != "Water", (
-            "Synthetic 0.4 m cell must NOT be falsely masked as Water"
-        )
-        assert result.iloc[1]["risk_class"] != "Water"
-
     def test_non_water_cell_preserves_risk_class(self):
         """Cells outside water polygons keep their original risk_class."""
         grid = _make_grid([77.55, 77.56], [12.84, 12.84], [50.0, 50.0])
@@ -172,6 +142,120 @@ class TestWaterMaskingHardOverride:
         empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         result = _pipeline()._apply_water_mask_and_proximity_boost(grid, empty_wb, _config())
         assert "is_coastal_tsunami_risk" in result.columns
+
+    def test_elevation_source_ignored(self):
+        """
+        Ocean_Detector produces identical results regardless of elevation_source value.
+
+        Validates: Requirements 3.3
+        """
+        from unittest.mock import patch
+
+        # Synthetic land polygon: 77.0–78.0°E, 12.0–13.0°N
+        # Cell centroid at (65.1005, 18.1005) is clearly outside → ocean classification fires.
+        synthetic_land_box = box(77.0, 12.0, 78.0, 13.0)
+
+        # Cell centroid well outside the synthetic land polygon
+        grid = _make_grid([65.1], [18.1], [50.0])
+        empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        config = _config()
+        pipeline = _pipeline()
+
+        elevation_sources = [
+            "synthetic",
+            "opentopodata_srtm",
+            "/some/arbitrary/path/to/elevation.tif",
+        ]
+
+        results = []
+        with patch(
+            "flood_risk_zonation.pipeline._load_land_mask",
+            return_value=synthetic_land_box,
+        ):
+            for source in elevation_sources:
+                result = pipeline._apply_water_mask_and_proximity_boost(
+                    grid.copy(), empty_wb, config, elevation_source=source
+                )
+                results.append(result)
+
+        # All three runs must produce identical classification for every cell
+        for i, source in enumerate(elevation_sources[1:], start=1):
+            ref = results[0]
+            cmp = results[i]
+            assert list(ref["risk_class"]) == list(cmp["risk_class"]), (
+                f"risk_class differs for elevation_source={elevation_sources[i]!r}: "
+                f"{list(ref['risk_class'])} vs {list(cmp['risk_class'])}"
+            )
+            assert list(ref["risk_score"]) == list(cmp["risk_score"]), (
+                f"risk_score differs for elevation_source={elevation_sources[i]!r}: "
+                f"{list(ref['risk_score'])} vs {list(cmp['risk_score'])}"
+            )
+            assert list(ref["water_mask_reason"]) == list(cmp["water_mask_reason"]), (
+                f"water_mask_reason differs for elevation_source={elevation_sources[i]!r}: "
+                f"{list(ref['water_mask_reason'])} vs {list(cmp['water_mask_reason'])}"
+            )
+
+    def test_land_centroid_not_classified_as_water(self):
+        """A cell whose centroid falls inside the land polygon must NOT become Water/landmask.
+
+        Validates: Requirements 3.1
+        """
+        from unittest.mock import patch
+        from shapely.geometry import box as shapely_box
+
+        # Synthetic land polygon: 77.0–78.0°E, 12.0–13.0°N
+        synthetic_land = shapely_box(77.0, 12.0, 78.0, 13.0)
+
+        # Cell centroid clearly inside the land box (77.5, 12.5)
+        grid = _make_grid([77.4995], [12.4995], [50.0])
+
+        empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+        with patch("flood_risk_zonation.pipeline._load_land_mask", return_value=synthetic_land):
+            result = _pipeline()._apply_water_mask_and_proximity_boost(
+                grid, empty_wb, _config()
+            )
+
+        row = result.iloc[0]
+        assert row["risk_class"] != "Water", (
+            f"Land centroid must not be classified as Water; got risk_class={row['risk_class']!r}"
+        )
+        assert row["water_mask_reason"] != "landmask", (
+            f"Land centroid must not have water_mask_reason='landmask'; "
+            f"got {row['water_mask_reason']!r}"
+        )
+
+    def test_ocean_centroid_classified_as_water(self):
+        """
+        A cell centroid outside the synthetic land polygon is classified as Water
+        with risk_score=0.0 and water_mask_reason='landmask'.
+
+        Validates: Requirements 3.1, 3.2
+        """
+        from unittest.mock import patch
+        from shapely.geometry import box as shapely_box
+
+        # Synthetic land polygon: 77.0–78.0°E, 12.0–13.0°N
+        synthetic_land = shapely_box(77.0, 12.0, 78.0, 13.0)
+
+        # Cell centroid at (65.1, 18.1) — clearly outside the land polygon (Arabian Sea)
+        grid = _make_grid([65.0], [18.0], [50.0])
+
+        empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+        with patch("flood_risk_zonation.pipeline._load_land_mask", return_value=synthetic_land):
+            result = _pipeline()._apply_water_mask_and_proximity_boost(grid, empty_wb, _config())
+
+        row = result.iloc[0]
+        assert row["risk_class"] == "Water", (
+            f"Expected risk_class='Water' for ocean centroid, got '{row['risk_class']}'"
+        )
+        assert row["risk_score"] == 0.0, (
+            f"Expected risk_score=0.0 for ocean centroid, got {row['risk_score']}"
+        )
+        assert row["water_mask_reason"] == "landmask", (
+            f"Expected water_mask_reason='landmask', got '{row['water_mask_reason']}'"
+        )
 
 
 # ── Part 2: Coastal tsunami flag ──────────────────────────────────────────────
@@ -286,3 +370,275 @@ class TestCoastalTsunamiFlag:
         assert flagged >= 1, (
             f"At least one land cell adjacent to ocean should be flagged; got {flagged}"
         )
+
+
+# ── Part 3: _load_land_mask error paths ──────────────────────────────────────
+
+class TestLoadLandMask:
+    """Unit tests for _load_land_mask error paths and caching behaviour."""
+
+    def test_missing_file_raises_flood_risk_error(self, tmp_path):
+        """FloodRiskError is raised when _LAND_MASK_PATH points to a nonexistent file."""
+        import flood_risk_zonation.pipeline as _pipeline_module
+        from unittest.mock import patch
+
+        from flood_risk_zonation.exceptions import FloodRiskError
+        from flood_risk_zonation.pipeline import _load_land_mask
+
+        nonexistent = tmp_path / "no_such_file.geojson"
+        # Reset cache so we always exercise the load path
+        original_geom = _pipeline_module._LAND_MASK_GEOM
+        _pipeline_module._LAND_MASK_GEOM = None
+        try:
+            with patch.object(_pipeline_module, "_LAND_MASK_PATH", nonexistent):
+                with pytest.raises(FloodRiskError, match="Land mask file not found"):
+                    _load_land_mask()
+        finally:
+            _pipeline_module._LAND_MASK_GEOM = original_geom
+
+    def test_read_file_exception_raises_flood_risk_error(self):
+        """FloodRiskError is raised when geopandas.read_file throws."""
+        import flood_risk_zonation.pipeline as _pipeline_module
+        from unittest.mock import patch, MagicMock
+
+        from flood_risk_zonation.exceptions import FloodRiskError
+        from flood_risk_zonation.pipeline import _load_land_mask
+
+        original_geom = _pipeline_module._LAND_MASK_GEOM
+        _pipeline_module._LAND_MASK_GEOM = None
+        try:
+            # Make the path appear to exist but read_file raise
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            with patch.object(_pipeline_module, "_LAND_MASK_PATH", mock_path):
+                with patch("flood_risk_zonation.pipeline.gpd") as mock_gpd:
+                    mock_gpd.read_file.side_effect = RuntimeError("bad geojson")
+                    with pytest.raises(FloodRiskError, match="Failed to parse land mask"):
+                        _load_land_mask()
+        finally:
+            _pipeline_module._LAND_MASK_GEOM = original_geom
+
+    def test_empty_geometry_after_dissolve_raises_flood_risk_error(self):
+        """FloodRiskError is raised when unary_union returns an empty geometry."""
+        import flood_risk_zonation.pipeline as _pipeline_module
+        from unittest.mock import patch, MagicMock
+
+        from flood_risk_zonation.exceptions import FloodRiskError
+        from flood_risk_zonation.pipeline import _load_land_mask
+
+        original_geom = _pipeline_module._LAND_MASK_GEOM
+        _pipeline_module._LAND_MASK_GEOM = None
+        try:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            # Build a mock GeoDataFrame whose geometry list will be passed to unary_union
+            mock_geom_series = MagicMock()
+            mock_geom_series.tolist.return_value = []
+            mock_gdf = MagicMock()
+            mock_gdf.geometry = mock_geom_series
+
+            # Empty geometry returned by unary_union
+            empty_geom = MagicMock()
+            empty_geom.is_empty = True
+
+            with patch.object(_pipeline_module, "_LAND_MASK_PATH", mock_path):
+                with patch("flood_risk_zonation.pipeline.gpd") as mock_gpd:
+                    mock_gpd.read_file.return_value = mock_gdf
+                    with patch("shapely.ops.unary_union", return_value=empty_geom):
+                        with pytest.raises(
+                            FloodRiskError, match="Land mask geometry is empty after dissolve"
+                        ):
+                            _load_land_mask()
+        finally:
+            _pipeline_module._LAND_MASK_GEOM = original_geom
+
+    def test_cache_hit_reads_file_only_once(self, tmp_path):
+        """geopandas.read_file is called exactly once across two _load_land_mask calls."""
+        import flood_risk_zonation.pipeline as _pipeline_module
+        from unittest.mock import patch, MagicMock
+
+        from flood_risk_zonation.pipeline import _load_land_mask
+
+        original_geom = _pipeline_module._LAND_MASK_GEOM
+        _pipeline_module._LAND_MASK_GEOM = None
+        try:
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            # Prepare a non-empty geometry for the dissolve result
+            mock_geom_series = MagicMock()
+            mock_geom_series.tolist.return_value = []
+            mock_gdf = MagicMock()
+            mock_gdf.geometry = mock_geom_series
+
+            from shapely.geometry import box as _box
+            real_geom = _box(77.0, 12.0, 78.0, 13.0)  # small non-empty polygon
+
+            with patch.object(_pipeline_module, "_LAND_MASK_PATH", mock_path):
+                with patch("flood_risk_zonation.pipeline.gpd") as mock_gpd:
+                    mock_gpd.read_file.return_value = mock_gdf
+                    with patch("shapely.ops.unary_union", return_value=real_geom):
+                        result1 = _load_land_mask()
+                        result2 = _load_land_mask()
+
+            # read_file must have been called exactly once (second call hits cache)
+            assert mock_gpd.read_file.call_count == 1
+            assert result1 is result2
+        finally:
+            _pipeline_module._LAND_MASK_GEOM = original_geom
+
+
+# ── Part 3: Integration tests with the real GeoJSON land mask ─────────────────
+
+_LANDMASK_PATH = (
+    __import__("pathlib").Path(__file__).parent.parent.parent
+    / "data" / "landmask" / "ne_50m_land.geojson"
+)
+
+
+def test_real_landmask_arabian_sea():
+    """
+    Integration test: a cell centroid at (65.1, 18.1) — open Arabian Sea — must
+    be classified as Water with water_mask_reason == 'landmask' using the real
+    ne_50m_land.geojson file.
+
+    Requirements: 7.1, 5.5
+    """
+    import flood_risk_zonation.pipeline as _pipeline_mod
+
+    if not _LANDMASK_PATH.exists():
+        pytest.skip(f"Real land mask file not found: {_LANDMASK_PATH}")
+
+    # Reset module-level cache to ensure a clean load from the real file.
+    _pipeline_mod._LAND_MASK_GEOM = None
+
+    # Build a one-cell grid with centroid at (65.1, 18.1) — Arabian Sea (open ocean).
+    # _make_grid takes the SW corner; centroid = lon + cell_size_deg/2, lat + cell_size_deg/2
+    cell_size_deg = 0.001
+    lon_sw = 65.1 - cell_size_deg / 2   # centroid_lon will be exactly 65.1
+    lat_sw = 18.1 - cell_size_deg / 2   # centroid_lat will be exactly 18.1
+    grid = _make_grid([lon_sw], [lat_sw], [0.0], cell_size_deg=cell_size_deg)
+
+    empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    result = _pipeline()._apply_water_mask_and_proximity_boost(grid, empty_wb, _config())
+
+    row = result.iloc[0]
+    assert row["water_mask_reason"] == "landmask", (
+        f"Expected water_mask_reason='landmask' for Arabian Sea cell, "
+        f"got '{row['water_mask_reason']}' (risk_class={row['risk_class']!r})"
+    )
+
+
+def test_real_landmask_dal_lake():
+    """
+    Integration test: a cell centroid at (74.86, 34.10) — Dal Lake, Srinagar (inland) —
+    must NOT be classified as ocean by the land mask. Dal Lake is surrounded by land in
+    the Natural Earth dataset, so water_mask_reason must NOT be 'landmask'.
+
+    Requirements: 7.3, 5.3
+    """
+    import flood_risk_zonation.pipeline as _pipeline_mod
+
+    if not _LANDMASK_PATH.exists():
+        pytest.skip(f"Real land mask file not found: {_LANDMASK_PATH}")
+
+    # Reset module-level cache to ensure a clean load from the real file.
+    _pipeline_mod._LAND_MASK_GEOM = None
+
+    # Build a one-cell grid with centroid at (74.86, 34.10) — Dal Lake, Srinagar.
+    # _make_grid takes the SW corner; centroid = lon + cell_size_deg/2, lat + cell_size_deg/2
+    cell_size_deg = 0.001
+    lon_sw = 74.86 - cell_size_deg / 2   # centroid_lon will be exactly 74.86
+    lat_sw = 34.10 - cell_size_deg / 2   # centroid_lat will be exactly 34.10
+    grid = _make_grid([lon_sw], [lat_sw], [0.0], cell_size_deg=cell_size_deg)
+
+    empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    result = _pipeline()._apply_water_mask_and_proximity_boost(grid, empty_wb, _config())
+
+    row = result.iloc[0]
+    assert row["water_mask_reason"] != "landmask", (
+        f"Dal Lake centroid must NOT have water_mask_reason='landmask' "
+        f"(it is inland land in Natural Earth); "
+        f"got water_mask_reason='{row['water_mask_reason']}' (risk_class={row['risk_class']!r})"
+    )
+
+
+def test_real_landmask_gottigere_land():
+    """
+    Integration test: a cell centroid at (77.59, 12.84) — Gottigere, Bangalore
+    (inland land) — must NOT be classified as ocean by the land-mask detector.
+    water_mask_reason must not equal 'landmask'.
+
+    Requirements: 7.2, 5.1
+    """
+    import flood_risk_zonation.pipeline as _pipeline_mod
+
+    if not _LANDMASK_PATH.exists():
+        pytest.skip(f"Real land mask file not found: {_LANDMASK_PATH}")
+
+    # Reset module-level cache to ensure a clean load from the real file.
+    _pipeline_mod._LAND_MASK_GEOM = None
+
+    # Build a one-cell grid with centroid at (77.59, 12.84) — Gottigere, Bangalore.
+    # _make_grid takes the SW corner; centroid = lon + cell_size_deg/2, lat + cell_size_deg/2
+    cell_size_deg = 0.001
+    lon_sw = 77.59 - cell_size_deg / 2   # centroid_lon will be exactly 77.59
+    lat_sw = 12.84 - cell_size_deg / 2   # centroid_lat will be exactly 12.84
+    grid = _make_grid([lon_sw], [lat_sw], [50.0], cell_size_deg=cell_size_deg)
+
+    empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    result = _pipeline()._apply_water_mask_and_proximity_boost(grid, empty_wb, _config())
+
+    row = result.iloc[0]
+    assert row["water_mask_reason"] != "landmask", (
+        f"Inland land cell at Gottigere must NOT have water_mask_reason='landmask'; "
+        f"got '{row['water_mask_reason']}' (risk_class={row['risk_class']!r})"
+    )
+
+
+# Feature: static-land-sea-mask, Property 7: Arabian Sea bounding boxes produce 100% ocean classification
+
+
+@given(
+    min_lon=st.floats(min_value=63.0, max_value=66.9),
+    min_lat=st.floats(min_value=16.0, max_value=19.9),
+)
+@settings(max_examples=10, deadline=None)
+def test_arabian_sea_all_cells_ocean(min_lon, min_lat):
+    """
+    Property test: any 0.1°×0.1° bounding box drawn from the Arabian Sea region
+    (lon 63–67°E, lat 16–20°N) should produce 100% ocean classification
+    (water_mask_reason == 'landmask') for every grid cell.
+
+    The real ne_50m_land.geojson is loaded once and cached by _load_land_mask(); all
+    50 Hypothesis examples share the same cached geometry after the first load.
+    deadline=None because the first example pays the one-time GeoJSON parse cost.
+
+    Validates: Requirements 7.6, 5.5
+    """
+    import flood_risk_zonation.pipeline as _pipeline_mod
+
+    if not _LANDMASK_PATH.exists():
+        pytest.skip(f"Real land mask file not found: {_LANDMASK_PATH}")
+
+    # Build a single 0.1°×0.1° grid cell whose SW corner is (min_lon, min_lat).
+    # _make_grid uses cell_size_deg for both width and height, so the cell spans
+    # [min_lon, min_lon+0.1] × [min_lat, min_lat+0.1].
+    cell_size_deg = 0.1
+    bbox_grid = _make_grid([min_lon], [min_lat], [0.0], cell_size_deg=cell_size_deg)
+
+    empty_wb = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    result = _pipeline()._apply_water_mask_and_proximity_boost(
+        bbox_grid, empty_wb, _config()
+    )
+
+    assert (result["water_mask_reason"] == "landmask").all(), (
+        f"Expected all cells to have water_mask_reason='landmask' for Arabian Sea bbox "
+        f"(min_lon={min_lon}, min_lat={min_lat}), but got: "
+        f"{result['water_mask_reason'].tolist()}"
+    )
