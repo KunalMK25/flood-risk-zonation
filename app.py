@@ -18,7 +18,7 @@ from flood_risk_zonation.config import BoundingBox, PipelineConfig, validate_bbo
 from flood_risk_zonation.exceptions import FloodRiskError
 from flood_risk_zonation.features.extractor import FEATURE_COLUMNS
 from flood_risk_zonation.ingest.sample_data import DEMO_REGIONS, DemoRegion
-from flood_risk_zonation.pipeline import FloodRiskPipeline
+from flood_risk_zonation.pipeline import FloodRiskPipeline, _load_land_mask
 from flood_risk_zonation.scoring.susceptibility import (
     WeightedSusceptibilityModel,
     RandomForestSusceptibilityModel,  # noqa: F401 — ensure module is loaded
@@ -198,6 +198,13 @@ medium_threshold = st.sidebar.slider("Medium / High boundary", 51.0, 90.0, 66.0,
 run_button = st.sidebar.button(
     "🚀 Run Analysis", type="primary", use_container_width=True
 )
+
+# --- Land Mask Status ---
+try:
+    _load_land_mask()
+    st.sidebar.markdown('<p style="color:#2ecc71;font-size:12px;margin-top:5px;margin-bottom:15px;text-align:center">🟢 <b>Land/Sea Mask</b>: Loaded & Active</p>', unsafe_allow_html=True)
+except Exception as e:
+    st.sidebar.markdown(f'<p style="color:#e74c3c;font-size:12px;margin-top:5px;margin-bottom:15px;text-align:center">🔴 <b>Land/Sea Mask</b>: Error ({e})</p>', unsafe_allow_html=True)
 
 # ── Live bbox size preview ────────────────────────────────────────────────────
 if not use_offline:
